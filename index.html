@@ -1436,10 +1436,13 @@ function PaybackChart({
     fill: "#8A938E"
   }, "CHF"));
 }
-function SoCSparkline({
+function MiniSparkline({
   data,
+  field,
+  color = "#F2B84B",
   width = 640,
-  height = 60
+  height = 60,
+  fixedMax = null
 }) {
   const margin = {
     top: 6,
@@ -1450,9 +1453,10 @@ function SoCSparkline({
   const w = width - margin.left - margin.right;
   const h = height - margin.top - margin.bottom;
   const n = data.length;
+  const maxV = fixedMax !== null ? fixedMax : Math.max(1, ...data.map(d => d[field]));
   const x = i => margin.left + i / (n - 1) * w;
-  const y = v => margin.top + h - v / 100 * h;
-  const points = data.map((d, i) => `${x(i)},${y(d.BatterieSoC)}`).join(" L ");
+  const y = v => margin.top + h - v / maxV * h;
+  const points = data.map((d, i) => `${x(i)},${y(d[field])}`).join(" L ");
   const areaPath = `M ${x(0)},${y(0)} L ${points} L ${x(n - 1)},${y(0)} Z`;
   return /*#__PURE__*/React.createElement("svg", {
     width: "100%",
@@ -1462,12 +1466,12 @@ function SoCSparkline({
     }
   }, /*#__PURE__*/React.createElement("path", {
     d: areaPath,
-    fill: "#F2B84B",
+    fill: color,
     fillOpacity: "0.18"
   }), /*#__PURE__*/React.createElement("polyline", {
     points: points,
     fill: "none",
-    stroke: "#F2B84B",
+    stroke: color,
     strokeWidth: "2"
   }));
 }
@@ -2149,6 +2153,376 @@ function StromtarifCockpit() {
     style: {
       borderRadius: 14,
       padding: 16,
+      marginTop: 16,
+      backgroundColor: "#1D2321",
+      border: "1px solid #2E3634",
+      boxShadow: "0 2px 16px rgba(0,0,0,0.25)"
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "stc-mono",
+    style: {
+      fontSize: 11,
+      textTransform: "uppercase",
+      color: "#8A938E",
+      marginBottom: 4
+    }
+  }, "📡 Netzsignal vom EW"), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 10,
+      color: "#5A6360",
+      marginBottom: 10
+    }
+  }, "Simulierter Trigger — hier würde in der Praxis ein reales Signal des Elektrizitätswerks andocken (z.B. via API/EEBus) und die Batteriesteuerung beeinflussen."), /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      gap: 6
+    }
+  }, [{
+    key: "gruen",
+    label: "🟢 Grün",
+    desc: "Normal"
+  }, {
+    key: "gelb",
+    label: "🟡 Gelb",
+    desc: "Angespannt"
+  }, {
+    key: "rot",
+    label: "🔴 Rot",
+    desc: "Kritisch"
+  }].map(opt => /*#__PURE__*/React.createElement("button", {
+    key: opt.key,
+    onClick: () => setLevers(p => ({
+      ...p,
+      ewSignal: opt.key
+    })),
+    style: {
+      flex: 1,
+      fontSize: 11,
+      padding: "8px 2px",
+      borderRadius: 8,
+      textAlign: "center",
+      border: `1px solid ${levers.ewSignal === opt.key ? "#4FA88C" : "#2E3634"}`,
+      color: levers.ewSignal === opt.key ? "#EDEDE9" : "#8A938E",
+      backgroundColor: levers.ewSignal === opt.key ? "#1A2420" : "transparent"
+    }
+  }, /*#__PURE__*/React.createElement("div", null, opt.label), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 9,
+      color: "#5A6360"
+    }
+  }, opt.desc)))), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 10,
+      color: "#5A6360",
+      marginTop: 8
+    }
+  }, levers.ewSignal === "rot" && "Rot: Netzladung der Batterie komplett gesperrt (Netzentlastung hat Vorrang).", levers.ewSignal === "gelb" && "Gelb: Netzladung auf 50% Leistung gedrosselt.", levers.ewSignal === "gruen" && "Grün: volle Vorausschau-/Arbitragefunktion erlaubt.")), /*#__PURE__*/React.createElement("div", {
+    style: {
+      borderRadius: 14,
+      padding: 16,
+      marginTop: 16,
+      backgroundColor: "#1D2321",
+      border: "1px solid #2E3634",
+      boxShadow: "0 2px 16px rgba(0,0,0,0.25)"
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "stc-mono",
+    style: {
+      fontSize: 11,
+      textTransform: "uppercase",
+      color: "#8A938E",
+      marginBottom: 4
+    }
+  }, "🎬 Szenarien (Trigger)"), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 10,
+      color: "#5A6360",
+      marginBottom: 10
+    }
+  }, "Ein Klick stellt Tagesprofil-Vorschau und Bedingungen auf ein Testszenario — praktisch für Kundengespräche und Demonstrationen."), /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "grid",
+      gridTemplateColumns: "1fr 1fr",
+      gap: 6
+    }
+  }, SCENARIOS.map(sc => /*#__PURE__*/React.createElement("button", {
+    key: sc.key,
+    onClick: () => applyScenario(sc),
+    style: {
+      fontSize: 11,
+      padding: "8px 6px",
+      borderRadius: 8,
+      textAlign: "left",
+      border: `1px solid ${activeScenario === sc.key ? "#E8A33D" : "#2E3634"}`,
+      color: activeScenario === sc.key ? "#EDEDE9" : "#8A938E",
+      backgroundColor: activeScenario === sc.key ? "#241D14" : "transparent"
+    }
+  }, sc.icon, " ", sc.label))), activeScenario && /*#__PURE__*/React.createElement("button", {
+    onClick: () => resetScenario(),
+    style: {
+      fontSize: 11,
+      marginTop: 8,
+      textDecoration: "underline",
+      color: "#8A938E",
+      background: "transparent",
+      border: "none",
+      padding: 0
+    }
+  }, "Szenario zurücksetzen")), /*#__PURE__*/React.createElement("div", {
+    style: {
+      borderRadius: 14,
+      padding: 16,
+      marginTop: 16,
+      backgroundColor: "#1D2321",
+      border: "1px solid #2E3634",
+      boxShadow: "0 2px 16px rgba(0,0,0,0.25)"
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "stc-mono",
+    style: {
+      fontSize: 11,
+      textTransform: "uppercase",
+      color: "#8A938E",
+      marginBottom: 4
+    }
+  }, "🌤️ Wetterprognose (Open-Meteo)"), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 10,
+      color: "#5A6360",
+      marginBottom: 10
+    }
+  }, "Kostenlose 7-Tage-Strahlungsprognose — fliesst als Bias in die vorausschauende Batteriesteuerung ein. Benötigt Internetverbindung."), /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      gap: 6,
+      marginBottom: 8,
+      flexWrap: "wrap"
+    }
+  }, WEATHER_LOCATIONS.map(loc => /*#__PURE__*/React.createElement("button", {
+    key: loc.name,
+    onClick: () => setWeatherLoc({
+      lat: loc.lat,
+      lon: loc.lon
+    }),
+    style: {
+      fontSize: 10,
+      padding: "4px 8px",
+      borderRadius: 8,
+      border: `1px solid ${weatherLoc.lat === loc.lat ? "#4FA88C" : "#2E3634"}`,
+      color: weatherLoc.lat === loc.lat ? "#EDEDE9" : "#8A938E",
+      backgroundColor: "transparent"
+    }
+  }, loc.name))), /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      gap: 6,
+      marginBottom: 8
+    }
+  }, /*#__PURE__*/React.createElement("input", {
+    type: "number",
+    value: weatherLoc.lat,
+    onChange: e => setWeatherLoc(p => ({
+      ...p,
+      lat: parseFloat(e.target.value)
+    })),
+    style: {
+      flex: 1,
+      fontSize: 11,
+      padding: "6px 8px",
+      borderRadius: 8,
+      background: "#14181A",
+      border: "1px solid #2E3634",
+      color: "#EDEDE9"
+    },
+    placeholder: "Breitengrad"
+  }), /*#__PURE__*/React.createElement("input", {
+    type: "number",
+    value: weatherLoc.lon,
+    onChange: e => setWeatherLoc(p => ({
+      ...p,
+      lon: parseFloat(e.target.value)
+    })),
+    style: {
+      flex: 1,
+      fontSize: 11,
+      padding: "6px 8px",
+      borderRadius: 8,
+      background: "#14181A",
+      border: "1px solid #2E3634",
+      color: "#EDEDE9"
+    },
+    placeholder: "Längengrad"
+  })), /*#__PURE__*/React.createElement("button", {
+    onClick: loadWeatherForecast,
+    disabled: weatherLoading,
+    style: {
+      width: "100%",
+      fontSize: 12,
+      padding: "8px 0",
+      borderRadius: 8,
+      border: "1px dashed #3A423F",
+      color: "#8A938E",
+      background: "transparent"
+    }
+  }, weatherLoading ? "Lädt…" : "📡 Prognose laden"), weatherError && /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 11,
+      color: "#D9705A",
+      marginTop: 6
+    }
+  }, weatherError), weatherForecast && /*#__PURE__*/React.createElement("div", {
+    style: {
+      marginTop: 10
+    }
+  }, /*#__PURE__*/React.createElement(ForecastMiniChart, {
+    data: weatherForecast.days
+  }), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 11,
+      color: "#8A938E",
+      marginTop: 6
+    }
+  }, "Ø nächste 7 Tage: ", /*#__PURE__*/React.createElement("span", {
+    style: {
+      color: "#F2B84B"
+    }
+  }, fmt0(weatherForecast.factor * 100), "%"), " vom saisonalen Mittel", weatherForecast.factor < 0.85 ? " — unterdurchschnittlich, Speicher hält mehr Reserve" : weatherForecast.factor > 1.15 ? " — überdurchschnittlich, Speicher verlässt sich mehr auf PV" : " — normal"), /*#__PURE__*/React.createElement("button", {
+    onClick: () => setWeatherForecast(null),
+    style: {
+      fontSize: 11,
+      marginTop: 6,
+      textDecoration: "underline",
+      color: "#8A938E",
+      background: "transparent",
+      border: "none",
+      padding: 0
+    }
+  }, "Prognose-Bias deaktivieren"))), /*#__PURE__*/React.createElement("div", {
+    style: {
+      borderRadius: 14,
+      padding: 16,
+      marginTop: 16,
+      backgroundColor: "#1A2420",
+      border: "1px solid #2E4A3E",
+      boxShadow: "0 2px 16px rgba(0,0,0,0.25)"
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "stc-mono",
+    style: {
+      fontSize: 11,
+      textTransform: "uppercase",
+      color: "#4FA88C",
+      marginBottom: 2
+    }
+  }, "⚡ Live-Vorschau"), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 10,
+      color: "#5A6360",
+      marginBottom: 10
+    }
+  }, "Reagiert sofort auf jeden Trigger & Hebel — Tagesvorschau ", activeScenario ? `(Szenario: ${SCENARIOS.find(s => s.key === activeScenario)?.label})` : `Tag ${dayIdx}`, "."), /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      flexWrap: "wrap",
+      gap: 8,
+      marginBottom: 10
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      flex: "1 1 45%",
+      minWidth: 100
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "stc-mono",
+    style: {
+      fontSize: 9,
+      color: "#8A938E"
+    }
+  }, "Netzbezug-Spitze"), /*#__PURE__*/React.createElement("div", {
+    className: "stc-display",
+    style: {
+      fontSize: 17,
+      fontWeight: 600,
+      color: "#E8A33D"
+    }
+  }, fmt1(Math.max(0, ...dayData.map(d => d.Netzbezug)) * 4), " kW")), /*#__PURE__*/React.createElement("div", {
+    style: {
+      flex: "1 1 45%",
+      minWidth: 100
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "stc-mono",
+    style: {
+      fontSize: 9,
+      color: "#8A938E"
+    }
+  }, "PV-Ertrag heute"), /*#__PURE__*/React.createElement("div", {
+    className: "stc-display",
+    style: {
+      fontSize: 17,
+      fontWeight: 600,
+      color: "#4FA88C"
+    }
+  }, fmt1(dayData.reduce((a, d) => a - d.PV, 0)), " kWh")), levers.battery && /*#__PURE__*/React.createElement("div", {
+    style: {
+      flex: "1 1 45%",
+      minWidth: 100
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "stc-mono",
+    style: {
+      fontSize: 9,
+      color: "#8A938E"
+    }
+  }, "Batterie-SoC (min–max)"), /*#__PURE__*/React.createElement("div", {
+    className: "stc-display",
+    style: {
+      fontSize: 17,
+      fontWeight: 600,
+      color: "#F2B84B"
+    }
+  }, fmt0(Math.min(...dayData.map(d => d.BatterieSoC))), "–", fmt0(Math.max(...dayData.map(d => d.BatterieSoC))), "%")), /*#__PURE__*/React.createElement("div", {
+    style: {
+      flex: "1 1 45%",
+      minWidth: 100
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "stc-mono",
+    style: {
+      fontSize: 9,
+      color: "#8A938E"
+    }
+  }, "Aktive Trigger"), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 11,
+      color: "#EDEDE9",
+      marginTop: 3
+    }
+  }, levers.ewSignal === "gruen" ? "🟢" : levers.ewSignal === "gelb" ? "🟡" : "🔴", " ", activeScenario ? SCENARIOS.find(s => s.key === activeScenario)?.icon : "—", " ", weatherForecast ? "🌤️" : ""))), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 10,
+      color: "#8A938E",
+      marginBottom: 3
+    }
+  }, "Netzbezug-Verlauf (heute)"), /*#__PURE__*/React.createElement(MiniSparkline, {
+    data: dayData,
+    field: "Netzbezug",
+    color: "#E8A33D"
+  }), levers.battery && /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 10,
+      color: "#8A938E",
+      margin: "8px 0 3px"
+    }
+  }, "Batterie-Ladezustand (heute)"), /*#__PURE__*/React.createElement(MiniSparkline, {
+    data: dayData,
+    field: "BatterieSoC",
+    color: "#F2B84B",
+    fixedMax: 100
+  }))), /*#__PURE__*/React.createElement("div", {
+    style: {
+      borderRadius: 14,
+      padding: 16,
       marginBottom: 16,
       backgroundColor: "#1D2321",
       border: "1px solid #2E3634",
@@ -2818,255 +3192,7 @@ function StromtarifCockpit() {
     max: 200,
     step: 5,
     unit: "CHF/kW·a"
-  }))), /*#__PURE__*/React.createElement("div", {
-    style: {
-      borderRadius: 14,
-      padding: 16,
-      marginTop: 16,
-      backgroundColor: "#1D2321",
-      border: "1px solid #2E3634",
-      boxShadow: "0 2px 16px rgba(0,0,0,0.25)"
-    }
-  }, /*#__PURE__*/React.createElement("div", {
-    className: "stc-mono",
-    style: {
-      fontSize: 11,
-      textTransform: "uppercase",
-      color: "#8A938E",
-      marginBottom: 4
-    }
-  }, "📡 Netzsignal vom EW"), /*#__PURE__*/React.createElement("div", {
-    style: {
-      fontSize: 10,
-      color: "#5A6360",
-      marginBottom: 10
-    }
-  }, "Simulierter Trigger — hier würde in der Praxis ein reales Signal des Elektrizitätswerks andocken (z.B. via API/EEBus) und die Batteriesteuerung beeinflussen."), /*#__PURE__*/React.createElement("div", {
-    style: {
-      display: "flex",
-      gap: 6
-    }
-  }, [{
-    key: "gruen",
-    label: "🟢 Grün",
-    desc: "Normal"
-  }, {
-    key: "gelb",
-    label: "🟡 Gelb",
-    desc: "Angespannt"
-  }, {
-    key: "rot",
-    label: "🔴 Rot",
-    desc: "Kritisch"
-  }].map(opt => /*#__PURE__*/React.createElement("button", {
-    key: opt.key,
-    onClick: () => setLevers(p => ({
-      ...p,
-      ewSignal: opt.key
-    })),
-    style: {
-      flex: 1,
-      fontSize: 11,
-      padding: "8px 2px",
-      borderRadius: 8,
-      textAlign: "center",
-      border: `1px solid ${levers.ewSignal === opt.key ? "#4FA88C" : "#2E3634"}`,
-      color: levers.ewSignal === opt.key ? "#EDEDE9" : "#8A938E",
-      backgroundColor: levers.ewSignal === opt.key ? "#1A2420" : "transparent"
-    }
-  }, /*#__PURE__*/React.createElement("div", null, opt.label), /*#__PURE__*/React.createElement("div", {
-    style: {
-      fontSize: 9,
-      color: "#5A6360"
-    }
-  }, opt.desc)))), /*#__PURE__*/React.createElement("div", {
-    style: {
-      fontSize: 10,
-      color: "#5A6360",
-      marginTop: 8
-    }
-  }, levers.ewSignal === "rot" && "Rot: Netzladung der Batterie komplett gesperrt (Netzentlastung hat Vorrang).", levers.ewSignal === "gelb" && "Gelb: Netzladung auf 50% Leistung gedrosselt.", levers.ewSignal === "gruen" && "Grün: volle Vorausschau-/Arbitragefunktion erlaubt.")), /*#__PURE__*/React.createElement("div", {
-    style: {
-      borderRadius: 14,
-      padding: 16,
-      marginTop: 16,
-      backgroundColor: "#1D2321",
-      border: "1px solid #2E3634",
-      boxShadow: "0 2px 16px rgba(0,0,0,0.25)"
-    }
-  }, /*#__PURE__*/React.createElement("div", {
-    className: "stc-mono",
-    style: {
-      fontSize: 11,
-      textTransform: "uppercase",
-      color: "#8A938E",
-      marginBottom: 4
-    }
-  }, "🎬 Szenarien (Trigger)"), /*#__PURE__*/React.createElement("div", {
-    style: {
-      fontSize: 10,
-      color: "#5A6360",
-      marginBottom: 10
-    }
-  }, "Ein Klick stellt Tagesprofil-Vorschau und Bedingungen auf ein Testszenario — praktisch für Kundengespräche und Demonstrationen."), /*#__PURE__*/React.createElement("div", {
-    style: {
-      display: "grid",
-      gridTemplateColumns: "1fr 1fr",
-      gap: 6
-    }
-  }, SCENARIOS.map(sc => /*#__PURE__*/React.createElement("button", {
-    key: sc.key,
-    onClick: () => applyScenario(sc),
-    style: {
-      fontSize: 11,
-      padding: "8px 6px",
-      borderRadius: 8,
-      textAlign: "left",
-      border: `1px solid ${activeScenario === sc.key ? "#E8A33D" : "#2E3634"}`,
-      color: activeScenario === sc.key ? "#EDEDE9" : "#8A938E",
-      backgroundColor: activeScenario === sc.key ? "#241D14" : "transparent"
-    }
-  }, sc.icon, " ", sc.label))), activeScenario && /*#__PURE__*/React.createElement("button", {
-    onClick: () => resetScenario(),
-    style: {
-      fontSize: 11,
-      marginTop: 8,
-      textDecoration: "underline",
-      color: "#8A938E",
-      background: "transparent",
-      border: "none",
-      padding: 0
-    }
-  }, "Szenario zurücksetzen")), /*#__PURE__*/React.createElement("div", {
-    style: {
-      borderRadius: 14,
-      padding: 16,
-      marginTop: 16,
-      backgroundColor: "#1D2321",
-      border: "1px solid #2E3634",
-      boxShadow: "0 2px 16px rgba(0,0,0,0.25)"
-    }
-  }, /*#__PURE__*/React.createElement("div", {
-    className: "stc-mono",
-    style: {
-      fontSize: 11,
-      textTransform: "uppercase",
-      color: "#8A938E",
-      marginBottom: 4
-    }
-  }, "🌤️ Wetterprognose (Open-Meteo)"), /*#__PURE__*/React.createElement("div", {
-    style: {
-      fontSize: 10,
-      color: "#5A6360",
-      marginBottom: 10
-    }
-  }, "Kostenlose 7-Tage-Strahlungsprognose — fliesst als Bias in die vorausschauende Batteriesteuerung ein. Benötigt Internetverbindung."), /*#__PURE__*/React.createElement("div", {
-    style: {
-      display: "flex",
-      gap: 6,
-      marginBottom: 8,
-      flexWrap: "wrap"
-    }
-  }, WEATHER_LOCATIONS.map(loc => /*#__PURE__*/React.createElement("button", {
-    key: loc.name,
-    onClick: () => setWeatherLoc({
-      lat: loc.lat,
-      lon: loc.lon
-    }),
-    style: {
-      fontSize: 10,
-      padding: "4px 8px",
-      borderRadius: 8,
-      border: `1px solid ${weatherLoc.lat === loc.lat ? "#4FA88C" : "#2E3634"}`,
-      color: weatherLoc.lat === loc.lat ? "#EDEDE9" : "#8A938E",
-      backgroundColor: "transparent"
-    }
-  }, loc.name))), /*#__PURE__*/React.createElement("div", {
-    style: {
-      display: "flex",
-      gap: 6,
-      marginBottom: 8
-    }
-  }, /*#__PURE__*/React.createElement("input", {
-    type: "number",
-    value: weatherLoc.lat,
-    onChange: e => setWeatherLoc(p => ({
-      ...p,
-      lat: parseFloat(e.target.value)
-    })),
-    style: {
-      flex: 1,
-      fontSize: 11,
-      padding: "6px 8px",
-      borderRadius: 8,
-      background: "#14181A",
-      border: "1px solid #2E3634",
-      color: "#EDEDE9"
-    },
-    placeholder: "Breitengrad"
-  }), /*#__PURE__*/React.createElement("input", {
-    type: "number",
-    value: weatherLoc.lon,
-    onChange: e => setWeatherLoc(p => ({
-      ...p,
-      lon: parseFloat(e.target.value)
-    })),
-    style: {
-      flex: 1,
-      fontSize: 11,
-      padding: "6px 8px",
-      borderRadius: 8,
-      background: "#14181A",
-      border: "1px solid #2E3634",
-      color: "#EDEDE9"
-    },
-    placeholder: "Längengrad"
-  })), /*#__PURE__*/React.createElement("button", {
-    onClick: loadWeatherForecast,
-    disabled: weatherLoading,
-    style: {
-      width: "100%",
-      fontSize: 12,
-      padding: "8px 0",
-      borderRadius: 8,
-      border: "1px dashed #3A423F",
-      color: "#8A938E",
-      background: "transparent"
-    }
-  }, weatherLoading ? "Lädt…" : "📡 Prognose laden"), weatherError && /*#__PURE__*/React.createElement("div", {
-    style: {
-      fontSize: 11,
-      color: "#D9705A",
-      marginTop: 6
-    }
-  }, weatherError), weatherForecast && /*#__PURE__*/React.createElement("div", {
-    style: {
-      marginTop: 10
-    }
-  }, /*#__PURE__*/React.createElement(ForecastMiniChart, {
-    data: weatherForecast.days
-  }), /*#__PURE__*/React.createElement("div", {
-    style: {
-      fontSize: 11,
-      color: "#8A938E",
-      marginTop: 6
-    }
-  }, "Ø nächste 7 Tage: ", /*#__PURE__*/React.createElement("span", {
-    style: {
-      color: "#F2B84B"
-    }
-  }, fmt0(weatherForecast.factor * 100), "%"), " vom saisonalen Mittel", weatherForecast.factor < 0.85 ? " — unterdurchschnittlich, Speicher hält mehr Reserve" : weatherForecast.factor > 1.15 ? " — überdurchschnittlich, Speicher verlässt sich mehr auf PV" : " — normal"), /*#__PURE__*/React.createElement("button", {
-    onClick: () => setWeatherForecast(null),
-    style: {
-      fontSize: 11,
-      marginTop: 6,
-      textDecoration: "underline",
-      color: "#8A938E",
-      background: "transparent",
-      border: "none",
-      padding: 0
-    }
-  }, "Prognose-Bias deaktivieren")))), /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("div", {
+  })))), /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("div", {
     style: {
       display: "flex",
       flexWrap: "wrap",
@@ -3302,8 +3428,11 @@ function StromtarifCockpit() {
       color: "#8A938E",
       marginBottom: 4
     }
-  }, "🔋 Batterie-Ladezustand (Tagesverlauf)"), /*#__PURE__*/React.createElement(SoCSparkline, {
-    data: dayData
+  }, "🔋 Batterie-Ladezustand (Tagesverlauf)"), /*#__PURE__*/React.createElement(MiniSparkline, {
+    data: dayData,
+    field: "BatterieSoC",
+    color: "#F2B84B",
+    fixedMax: 100
   }))), /*#__PURE__*/React.createElement("div", {
     style: {
       borderRadius: 14,
