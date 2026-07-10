@@ -1,4 +1,4 @@
-const CACHE_NAME = "stromtarif-cockpit-v3";
+const CACHE_NAME = "wattfox-cockpit-v5";
 const APP_SHELL = ["./", "./index.html", "./manifest.json", "./icon-192.png", "./icon-512.png", "./icon-512-maskable.png"];
 
 self.addEventListener("install", (event) => {
@@ -15,19 +15,20 @@ self.addEventListener("activate", (event) => {
   self.clients.claim();
 });
 
+// NETWORK-FIRST: versucht immer zuerst das Netz (garantiert die neueste
+// Version, sobald online), faellt nur bei fehlender Verbindung auf den
+// Cache zurueck. Verhindert, dass Updates durch einen alten Cache
+// "verschluckt" werden.
 self.addEventListener("fetch", (event) => {
   event.respondWith(
-    caches.match(event.request).then((cached) => {
-      if (cached) return cached;
-      return fetch(event.request)
-        .then((response) => {
-          if (response && response.status === 200) {
-            const clone = response.clone();
-            caches.open(CACHE_NAME).then((cache) => cache.put(event.request, clone));
-          }
-          return response;
-        })
-        .catch(() => cached);
-    })
+    fetch(event.request)
+      .then((response) => {
+        if (response && response.status === 200) {
+          const clone = response.clone();
+          caches.open(CACHE_NAME).then((cache) => cache.put(event.request, clone));
+        }
+        return response;
+      })
+      .catch(() => caches.match(event.request))
   );
 });
