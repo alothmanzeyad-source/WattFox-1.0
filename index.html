@@ -519,17 +519,65 @@ function ladDay(kw, count, sessionsPerWeek, shapeKey, d, startWeekday) {
   const dailyKwh = kw * count * (sessionsPerWeek / 7) * 2.2 * weekendFactor;
   return SHAPES[shapeKey].map(w => w * dailyKwh);
 }
-function isHT(d, stepInDay, startWeekday) {
+
+// Standard-Preissignal: mindestens 4 Tarife mit eigenen Zeitfenstern —
+// deckt gemeinsam lückenlos alle 24h/7 Tage ab (Reihenfolge = Priorität).
+const DEFAULT_TARIFF_TIERS = [{
+  id: "nt",
+  name: "Niedertarif",
+  price: 14,
+  startHour: 22,
+  endHour: 6,
+  scope: "all",
+  color: "#5B8DBE"
+}, {
+  id: "ht",
+  name: "Hochtarif",
+  price: 24,
+  startHour: 6,
+  endHour: 17,
+  scope: "weekday",
+  color: "#E8A33D"
+}, {
+  id: "peak",
+  name: "Spitzentarif",
+  price: 32,
+  startHour: 17,
+  endHour: 22,
+  scope: "weekday",
+  color: "#D9705A"
+}, {
+  id: "weekend",
+  name: "Wochenendtarif",
+  price: 13,
+  startHour: 6,
+  endHour: 22,
+  scope: "weekend",
+  color: "#4FA88C"
+}];
+
+// Ermittelt den aktiven Tarif für einen Zeitpunkt (Zeitfenster können über
+// Mitternacht laufen, z.B. 22-6 Uhr). scope: "all" | "weekday" | "weekend".
+function getTariffTier(tiers, d, stepInDay, startWeekday) {
   const hour = stepInDay / 4;
-  if (isWeekend(d, startWeekday)) return false;
-  return hour >= 6 && hour < 22;
+  const wknd = isWeekend(d, startWeekday);
+  for (const t of tiers) {
+    if (t.scope === "weekend" && !wknd) continue;
+    if (t.scope === "weekday" && wknd) continue;
+    if (t.startHour > t.endHour) {
+      if (hour >= t.startHour || hour < t.endHour) return t;
+    } else {
+      if (hour >= t.startHour && hour < t.endHour) return t;
+    }
+  }
+  return tiers[0];
 }
 
-// Prüft, ob innerhalb der nächsten `lookaheadSteps` 15-Min-Slots ein Wechsel
-// von NT auf HT ansteht (für die vorausschauende Batteriesteuerung: rechtzeitig
-// vor teuren Stunden aus günstigem NT-Strom vorladen). Schaut nötigenfalls
-// über die Tagesgrenze hinaus (max. 1 Tag weiter, für Lookaheads bis 24h).
-function htStartsWithin(d, stepInDay, startWeekday, lookaheadSteps, totalDays) {
+// Höchster Tarifpreis innerhalb der nächsten `lookaheadSteps` 15-Min-Slots
+// (für die vorausschauende Batteriesteuerung: erkennt bevorstehende teure
+// Zeitfenster, unabhängig davon wie viele Tarifstufen es gibt).
+function maxPriceWithin(tiers, d, stepInDay, startWeekday, lookaheadSteps, totalDays) {
+  let maxP = -Infinity;
   for (let k = 1; k <= lookaheadSteps; k++) {
     let dd = d,
       ss = stepInDay + k;
@@ -538,9 +586,10 @@ function htStartsWithin(d, stepInDay, startWeekday, lookaheadSteps, totalDays) {
       ss -= STEPS_PER_DAY;
     }
     if (dd >= totalDays) break;
-    if (isHT(dd, ss, startWeekday)) return true;
+    const t = getTariffTier(tiers, dd, ss, startWeekday);
+    if (t.price > maxP) maxP = t.price;
   }
-  return false;
+  return maxP === -Infinity ? 0 : maxP;
 }
 
 // ---------------------------------------------------------------------------
@@ -552,10 +601,12 @@ function runSimulation(cfg) {
     scale,
     levers,
     tariff,
+    tariffTiers,
     csvBase,
     startWeekday,
     forecastFactor
   } = cfg;
+  const tiers = tariffTiers && tariffTiers.length > 0 ? tariffTiers : DEFAULT_TARIFF_TIERS;
   const bt = BUILDING_TYPES[type];
   const annualKwh = bt.kwhPerUnit * scale;
   const days = csvBase ? Math.floor(csvBase.length / STEPS_PER_DAY) : DAYS;
@@ -585,8 +636,7 @@ function runSimulation(cfg) {
   let sumOnsite = 0,
     sumExport = 0,
     sumGrid = 0,
-    sumHT = 0,
-    sumNT = 0;
+    energyCostAccum = 0;
   let sumBatteryCharge = 0,
     sumBatteryDischarge = 0,
     sumBatteryGridCharge = 0;
@@ -600,6 +650,16 @@ function runSimulation(cfg) {
   const heatMax = Array.from({
     length: 7
   }, () => new Array(STEPS_PER_DAY).fill(0));
+  // Aufschlüsselung nach Tarifstufe (für die "Preissignal"-Auswertung)
+  const tierStats = {};
+  tiers.forEach(t => {
+    tierStats[t.id] = {
+      name: t.name,
+      color: t.color,
+      kwh: 0,
+      cost: 0
+    };
+  });
 
   // Batteriespeicher: Ladezustand (SoC) bleibt über das ganze Jahr erhalten
   // (kein Reset pro Tag) — ein echter Speicher lädt/entlädt kontinuierlich.
@@ -613,8 +673,6 @@ function runSimulation(cfg) {
   // Vorausschauende Steuerung (Tarif-Lookahead + EW-Signal + Wetterprognose-Bias)
   const predictive = battOn && levers.batteryStrategy === "predictive";
   const ewSignal = levers.ewSignal || "gruen"; // "gruen" | "gelb" | "rot"
-  const priceRatio = tariff.ntPrice > 0 ? tariff.htPrice / tariff.ntPrice : 1;
-  const arbitrageWorthwhile = priceRatio > 1.15;
   // forecastFactor: 1 = normaler Prognose-Ertrag, <1 = unterdurchschnittlich (mehr
   // Reserve halten), >1 = überdurchschnittlich (mehr auf PV verlassen). Kommt aus
   // der geladenen Wetterprognose (Open-Meteo); ohne Prognose = 1 (neutral).
@@ -666,13 +724,14 @@ function runSimulation(cfg) {
           surplus -= batteryCharge;
         }
 
-        // VORAUSSCHAUEND: Falls aktuell NT und in den nächsten Stunden HT
-        // beginnt, und der Tarifunterschied das lohnt, gezielt aus dem Netz
-        // vorladen (Tarif-Arbitrage) — gedrosselt/gesperrt je nach EW-Signal.
-        if (predictive && gridChargeAllowed && needsGridReserve && !isHT(d, s, startWeekday) && arbitrageWorthwhile) {
-          const willBeHT = htStartsWithin(d, s, startWeekday, lookaheadSteps, days);
+        // VORAUSSCHAUEND: Falls in den nächsten Stunden ein teureres Tarif-
+        // fenster beginnt und der Preisunterschied das lohnt, gezielt aus dem
+        // günstigeren aktuellen Tarif vorladen — gedrosselt/gesperrt je nach EW-Signal.
+        if (predictive && gridChargeAllowed && needsGridReserve) {
+          const currentTier = getTariffTier(tiers, d, s, startWeekday);
+          const futureMax = maxPriceWithin(tiers, d, s, startWeekday, lookaheadSteps, days);
           const targetSoc = capacityKwh * targetFraction;
-          if (willBeHT && soc < targetSoc) {
+          if (futureMax > currentTier.price * 1.15 && soc < targetSoc) {
             const remainingPower = Math.max(0, powerKw * 0.25 * gridChargePowerFactor - batteryCharge);
             const headroom = (targetSoc - soc) / oneWayEff;
             batteryGridCharge = Math.min(remainingPower, Math.max(0, headroom));
@@ -713,8 +772,12 @@ function runSimulation(cfg) {
       heatSum[wd][s] += gridKw;
       heatCount[wd][s] += 1;
       if (gridKw > heatMax[wd][s]) heatMax[wd][s] = gridKw;
-      const ht = isHT(d, s, startWeekday);
-      if (ht) sumHT += grid;else sumNT += grid;
+      const tier = getTariffTier(tiers, d, s, startWeekday);
+      const price = tier.price;
+      const intervalCost = grid * price / 100;
+      energyCostAccum += intervalCost;
+      tierStats[tier.id].kwh += grid;
+      tierStats[tier.id].cost += intervalCost;
       monthly[month].base += base[s];
       monthly[month].pv += pv[s];
       monthly[month].wp += wp[s];
@@ -724,12 +787,11 @@ function runSimulation(cfg) {
       monthly[month].grid += grid;
       monthly[month].exportKwh += exp;
       monthly[month].batteryDischarge += batteryDischarge;
-      const price = ht ? tariff.htPrice : tariff.ntPrice;
-      monthly[month].costEnergy += grid * price / 100;
+      monthly[month].costEnergy += intervalCost;
       monthly[month].costNetz += grid * tariff.netzentgelt / 100;
     }
   }
-  const energyCost = (sumHT * tariff.htPrice + sumNT * tariff.ntPrice) / 100;
+  const energyCost = energyCostAccum;
   const netzCost = sumGrid * tariff.netzentgelt / 100;
   const leistungsCost = tariff.leistungActive ? peakGrid * tariff.leistungspreis : 0;
   const einspeiseErtrag = sumExport * tariff.einspeise / 100;
@@ -769,6 +831,7 @@ function runSimulation(cfg) {
     batteryCycles,
     capacityKwh,
     powerKw,
+    tierStats,
     monthly,
     durationSampled,
     heatMax,
@@ -829,23 +892,45 @@ const WEATHER_LOCATIONS = [{
 // Wandelt Open-Meteo-Stundenwerte (Globalstrahlung W/m²) in eine grobe
 // Tagesprognose um: erwarteter PV-Ertrag [kWh je kWp] + Verhältnis zum
 // saisonal üblichen Modellwert (= "Prognose-Faktor" für die Batteriesteuerung).
+function weatherIcon(cloudCover) {
+  if (cloudCover < 20) return "☀️";
+  if (cloudCover < 50) return "🌤️";
+  if (cloudCover < 80) return "⛅";
+  return "☁️";
+}
 function processWeatherForecast(json, currentDayOfYear) {
   const times = json.hourly.time;
   const radiation = json.hourly.shortwave_radiation;
+  const cloudCover = json.hourly.cloud_cover || [];
+  const temperature = json.hourly.temperature_2m || [];
   const byDay = {};
   for (let i = 0; i < times.length; i++) {
     const dateKey = times[i].slice(0, 10);
-    if (!byDay[dateKey]) byDay[dateKey] = [];
-    byDay[dateKey].push(radiation[i] || 0);
+    if (!byDay[dateKey]) byDay[dateKey] = {
+      rad: [],
+      cloud: [],
+      temp: []
+    };
+    byDay[dateKey].rad.push(radiation[i] || 0);
+    byDay[dateKey].cloud.push(cloudCover[i] != null ? cloudCover[i] : 50);
+    byDay[dateKey].temp.push(temperature[i] != null ? temperature[i] : null);
   }
   const dateKeys = Object.keys(byDay).sort();
   const performanceRatio = 0.85; // System-/Temperaturverluste, typische Annahme
-  const days = dateKeys.slice(0, 7).map((key, idx) => {
-    const hours = byDay[key];
-    const kwhPerKwp = hours.reduce((sum, w) => sum + w / 1000 * performanceRatio, 0);
+  const days = dateKeys.slice(0, 7).map(key => {
+    const b = byDay[key];
+    const kwhPerKwp = b.rad.reduce((sum, w) => sum + w / 1000 * performanceRatio, 0);
+    const avgCloud = b.cloud.reduce((a, v) => a + v, 0) / b.cloud.length;
+    const temps = b.temp.filter(t => t !== null);
+    const minTemp = temps.length ? Math.min(...temps) : null;
+    const maxTemp = temps.length ? Math.max(...temps) : null;
     return {
       date: key,
-      kwhPerKwp: +kwhPerKwp.toFixed(2)
+      kwhPerKwp: +kwhPerKwp.toFixed(2),
+      cloudCover: Math.round(avgCloud),
+      minTemp: minTemp !== null ? Math.round(minTemp) : null,
+      maxTemp: maxTemp !== null ? Math.round(maxTemp) : null,
+      icon: weatherIcon(avgCloud)
     };
   });
   // Vergleich zum saisonal erwarteten Modellwert (unsere eigene pvIrradiance-Kurve)
@@ -859,7 +944,9 @@ function processWeatherForecast(json, currentDayOfYear) {
   const factor = avgModel > 0 ? avgForecast / avgModel : 1;
   return {
     days,
-    factor: Math.max(0.3, Math.min(2, factor))
+    factor: Math.max(0.3, Math.min(2, factor)),
+    avgForecast: +avgForecast.toFixed(2),
+    avgModel: +avgModel.toFixed(2)
   };
 }
 const WEEKDAY_LABELS = ["Mo", "Di", "Mi", "Do", "Fr", "Sa", "So"];
@@ -1475,51 +1562,116 @@ function MiniSparkline({
     strokeWidth: "2"
   }));
 }
-function ForecastMiniChart({
-  data,
-  width = 320,
-  height = 100
+
+// Visualisiert ein Tarifschema als farbige 24h-Leiste (separat für Werktag/
+// Wochenende) — macht die Zeitfenster auf einen Blick verständlich.
+function TariffScheduleStrip({
+  tiers,
+  weekend = false
 }) {
-  const margin = {
-    top: 8,
-    right: 6,
-    bottom: 18,
-    left: 6
-  };
-  const w = width - margin.left - margin.right;
-  const h = height - margin.top - margin.bottom;
-  const n = data.length;
-  const bw = w / n * 0.6;
-  const gap = w / n * 0.4;
-  const maxV = Math.max(1, ...data.map(d => d.kwhPerKwp)) * 1.15;
-  const y = v => margin.top + h - v / maxV * h;
-  const WD = ["So", "Mo", "Di", "Mi", "Do", "Fr", "Sa"];
-  return /*#__PURE__*/React.createElement("svg", {
-    width: "100%",
-    viewBox: `0 0 ${width} ${height}`,
+  const segments = [];
+  for (let h = 0; h < 24; h++) {
+    const tier = tiers.find(t => {
+      if (t.scope === "weekend" && !weekend) return false;
+      if (t.scope === "weekday" && weekend) return false;
+      return t.startHour > t.endHour ? h >= t.startHour || h < t.endHour : h >= t.startHour && h < t.endHour;
+    }) || tiers[0];
+    segments.push(tier);
+  }
+  return /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("div", {
     style: {
-      display: "block"
+      display: "flex",
+      height: 14,
+      borderRadius: 4,
+      overflow: "hidden"
+    }
+  }, segments.map((t, i) => /*#__PURE__*/React.createElement("div", {
+    key: i,
+    style: {
+      flex: 1,
+      backgroundColor: t.color
+    },
+    title: `${i}:00 ${t.name}`
+  }))), /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      justifyContent: "space-between",
+      fontSize: 8,
+      color: "#5A6360",
+      marginTop: 2
+    }
+  }, /*#__PURE__*/React.createElement("span", null, "0h"), /*#__PURE__*/React.createElement("span", null, "6h"), /*#__PURE__*/React.createElement("span", null, "12h"), /*#__PURE__*/React.createElement("span", null, "18h"), /*#__PURE__*/React.createElement("span", null, "24h")));
+}
+function WeatherDayCards({
+  data
+}) {
+  const WD = ["So", "Mo", "Di", "Mi", "Do", "Fr", "Sa"];
+  const maxKwh = Math.max(1, ...data.map(d => d.kwhPerKwp));
+  return /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "grid",
+      gridTemplateColumns: `repeat(${data.length}, 1fr)`,
+      gap: 6
     }
   }, data.map((d, i) => {
-    const bx = margin.left + i * (bw + gap) + gap / 2;
-    const yTop = y(d.kwhPerKwp);
     const wd = WD[new Date(d.date).getDay()];
-    return /*#__PURE__*/React.createElement("g", {
-      key: i
-    }, /*#__PURE__*/React.createElement("rect", {
-      x: bx,
-      y: yTop,
-      width: bw,
-      height: margin.top + h - yTop,
-      fill: "#F2B84B",
-      rx: "2"
-    }), /*#__PURE__*/React.createElement("text", {
-      x: bx + bw / 2,
-      y: height - 4,
-      fontSize: "8",
-      fill: "#8A938E",
-      textAnchor: "middle"
-    }, wd));
+    const barPct = Math.max(4, d.kwhPerKwp / maxKwh * 100);
+    return /*#__PURE__*/React.createElement("div", {
+      key: i,
+      style: {
+        borderRadius: 10,
+        padding: "8px 4px",
+        textAlign: "center",
+        backgroundColor: i === 0 ? "#20302A" : "#181D1F",
+        border: `1px solid ${i === 0 ? "#4FA88C" : "#2E3634"}`
+      }
+    }, /*#__PURE__*/React.createElement("div", {
+      className: "stc-mono",
+      style: {
+        fontSize: 9,
+        color: i === 0 ? "#4FA88C" : "#8A938E",
+        fontWeight: 600
+      }
+    }, i === 0 ? "HEUTE" : wd), /*#__PURE__*/React.createElement("div", {
+      style: {
+        fontSize: 20,
+        margin: "4px 0"
+      }
+    }, d.icon), /*#__PURE__*/React.createElement("div", {
+      style: {
+        height: 30,
+        display: "flex",
+        alignItems: "flex-end",
+        justifyContent: "center",
+        marginBottom: 3
+      }
+    }, /*#__PURE__*/React.createElement("div", {
+      style: {
+        width: 10,
+        height: `${barPct}%`,
+        backgroundColor: "#F2B84B",
+        borderRadius: 3,
+        minHeight: 3
+      }
+    })), /*#__PURE__*/React.createElement("div", {
+      className: "stc-display",
+      style: {
+        fontSize: 11,
+        fontWeight: 600,
+        color: "#F2B84B"
+      }
+    }, d.kwhPerKwp), /*#__PURE__*/React.createElement("div", {
+      style: {
+        fontSize: 8,
+        color: "#5A6360"
+      }
+    }, "kWh/kWp"), d.maxTemp !== null && /*#__PURE__*/React.createElement("div", {
+      style: {
+        fontSize: 9,
+        color: "#8A938E",
+        marginTop: 3
+      }
+    }, d.maxTemp, "° / ", d.minTemp, "°"));
   }));
 }
 function LoadHeatmap({
@@ -1820,13 +1972,14 @@ function StromtarifCockpit() {
     ladSessionsPerWeek: 4
   });
   const [tariff, setTariff] = useState({
-    htPrice: 22,
-    ntPrice: 15,
     netzentgelt: 9,
     einspeise: 8,
     leistungActive: false,
     leistungspreis: 90
   });
+  const [tariffTiers, setTariffTiers] = useState(DEFAULT_TARIFF_TIERS.map(t => ({
+    ...t
+  })));
   const [dayIdx, setDayIdx] = useState(200);
   const [activeScenario, setActiveScenario] = useState(null);
   const [scenarioPvFactor, setScenarioPvFactor] = useState(1);
@@ -1841,6 +1994,12 @@ function StromtarifCockpit() {
   const [heatMode, setHeatMode] = useState("max");
   const [uploadError, setUploadError] = useState(null);
   const bt = BUILDING_TYPES[type];
+  function updateTier(index, patch) {
+    setTariffTiers(prev => prev.map((t, i) => i === index ? {
+      ...t,
+      ...patch
+    } : t));
+  }
   function applyScenario(sc) {
     setActiveScenario(sc.key);
     setDayIdx(sc.dayIdx);
@@ -1856,7 +2015,7 @@ function StromtarifCockpit() {
     setWeatherLoading(true);
     setWeatherError(null);
     try {
-      const url = `https://api.open-meteo.com/v1/forecast?latitude=${weatherLoc.lat}&longitude=${weatherLoc.lon}&hourly=shortwave_radiation&forecast_days=7&timezone=auto`;
+      const url = `https://api.open-meteo.com/v1/forecast?latitude=${weatherLoc.lat}&longitude=${weatherLoc.lon}&hourly=shortwave_radiation,cloud_cover,temperature_2m&forecast_days=7&timezone=auto`;
       const res = await fetch(url);
       if (!res.ok) throw new Error(`Wetterdienst antwortete mit HTTP ${res.status}`);
       const json = await res.json();
@@ -1958,19 +2117,20 @@ function StromtarifCockpit() {
     return activeDataset.unit === "kW" ? activeDataset.values.map(v => v * 0.25) : activeDataset.values;
   }, [activeDataset]);
   const effectiveForecastFactor = activeScenario ? scenarioPvFactor : weatherForecast ? weatherForecast.factor : 1;
-  const effectiveTariff = useMemo(() => scenarioTariffMultiplier !== 1 ? {
-    ...tariff,
-    htPrice: tariff.htPrice * scenarioTariffMultiplier
-  } : tariff, [tariff, scenarioTariffMultiplier]);
+  const effectiveTariffTiers = useMemo(() => scenarioTariffMultiplier !== 1 ? tariffTiers.map(t => ({
+    ...t,
+    price: t.price * scenarioTariffMultiplier
+  })) : tariffTiers, [tariffTiers, scenarioTariffMultiplier]);
   const sim = useMemo(() => runSimulation({
     type,
     scale,
     levers,
-    tariff: effectiveTariff,
+    tariff,
+    tariffTiers: effectiveTariffTiers,
     csvBase: csvBaseKwh,
     startWeekday: 1,
     forecastFactor: effectiveForecastFactor
-  }), [type, scale, levers, effectiveTariff, csvBaseKwh, effectiveForecastFactor]);
+  }), [type, scale, levers, tariff, effectiveTariffTiers, csvBaseKwh, effectiveForecastFactor]);
   const dayData = useMemo(() => {
     const d = dayIdx;
     const dayCountCsv = csvBaseKwh ? Math.max(1, Math.floor(csvBaseKwh.length / STEPS_PER_DAY)) : DAYS;
@@ -2070,7 +2230,8 @@ function StromtarifCockpit() {
       type,
       scale,
       levers: refLevers,
-      tariff: effectiveTariff,
+      tariff,
+      tariffTiers: effectiveTariffTiers,
       csvBase: csvBaseKwh,
       startWeekday: 1,
       forecastFactor: effectiveForecastFactor
@@ -2085,7 +2246,7 @@ function StromtarifCockpit() {
       kostenOhneBatterie: refSim.totalCost,
       kostenMitBatterie: sim.totalCost
     };
-  }, [levers, effectiveTariff, csvBaseKwh, type, scale, sim.totalCost, effectiveForecastFactor]);
+  }, [levers, tariff, effectiveTariffTiers, csvBaseKwh, type, scale, sim.totalCost, effectiveForecastFactor]);
   return /*#__PURE__*/React.createElement("div", {
     style: {
       background: "radial-gradient(circle at 15% 0%, #1B211F 0%, #14181A 55%)",
@@ -2164,379 +2325,9 @@ function StromtarifCockpit() {
       fontSize: 11,
       textTransform: "uppercase",
       color: "#8A938E",
-      marginBottom: 4
-    }
-  }, "📡 Netzsignal vom EW"), /*#__PURE__*/React.createElement("div", {
-    style: {
-      fontSize: 10,
-      color: "#5A6360",
-      marginBottom: 10
-    }
-  }, "Simulierter Trigger — hier würde in der Praxis ein reales Signal des Elektrizitätswerks andocken (z.B. via API/EEBus) und die Batteriesteuerung beeinflussen."), /*#__PURE__*/React.createElement("div", {
-    style: {
-      display: "flex",
-      gap: 6
-    }
-  }, [{
-    key: "gruen",
-    label: "🟢 Grün",
-    desc: "Normal"
-  }, {
-    key: "gelb",
-    label: "🟡 Gelb",
-    desc: "Angespannt"
-  }, {
-    key: "rot",
-    label: "🔴 Rot",
-    desc: "Kritisch"
-  }].map(opt => /*#__PURE__*/React.createElement("button", {
-    key: opt.key,
-    onClick: () => setLevers(p => ({
-      ...p,
-      ewSignal: opt.key
-    })),
-    style: {
-      flex: 1,
-      fontSize: 11,
-      padding: "8px 2px",
-      borderRadius: 8,
-      textAlign: "center",
-      border: `1px solid ${levers.ewSignal === opt.key ? "#4FA88C" : "#2E3634"}`,
-      color: levers.ewSignal === opt.key ? "#EDEDE9" : "#8A938E",
-      backgroundColor: levers.ewSignal === opt.key ? "#1A2420" : "transparent"
-    }
-  }, /*#__PURE__*/React.createElement("div", null, opt.label), /*#__PURE__*/React.createElement("div", {
-    style: {
-      fontSize: 9,
-      color: "#5A6360"
-    }
-  }, opt.desc)))), /*#__PURE__*/React.createElement("div", {
-    style: {
-      fontSize: 10,
-      color: "#5A6360",
-      marginTop: 8
-    }
-  }, levers.ewSignal === "rot" && "Rot: Netzladung der Batterie komplett gesperrt (Netzentlastung hat Vorrang).", levers.ewSignal === "gelb" && "Gelb: Netzladung auf 50% Leistung gedrosselt.", levers.ewSignal === "gruen" && "Grün: volle Vorausschau-/Arbitragefunktion erlaubt.")), /*#__PURE__*/React.createElement("div", {
-    style: {
-      borderRadius: 14,
-      padding: 16,
-      marginTop: 16,
-      backgroundColor: "#1D2321",
-      border: "1px solid #2E3634",
-      boxShadow: "0 2px 16px rgba(0,0,0,0.25)"
-    }
-  }, /*#__PURE__*/React.createElement("div", {
-    className: "stc-mono",
-    style: {
-      fontSize: 11,
-      textTransform: "uppercase",
-      color: "#8A938E",
-      marginBottom: 4
-    }
-  }, "🎬 Szenarien (Trigger)"), /*#__PURE__*/React.createElement("div", {
-    style: {
-      fontSize: 10,
-      color: "#5A6360",
-      marginBottom: 10
-    }
-  }, "Ein Klick stellt Tagesprofil-Vorschau und Bedingungen auf ein Testszenario — praktisch für Kundengespräche und Demonstrationen."), /*#__PURE__*/React.createElement("div", {
-    style: {
-      display: "grid",
-      gridTemplateColumns: "1fr 1fr",
-      gap: 6
-    }
-  }, SCENARIOS.map(sc => /*#__PURE__*/React.createElement("button", {
-    key: sc.key,
-    onClick: () => applyScenario(sc),
-    style: {
-      fontSize: 11,
-      padding: "8px 6px",
-      borderRadius: 8,
-      textAlign: "left",
-      border: `1px solid ${activeScenario === sc.key ? "#E8A33D" : "#2E3634"}`,
-      color: activeScenario === sc.key ? "#EDEDE9" : "#8A938E",
-      backgroundColor: activeScenario === sc.key ? "#241D14" : "transparent"
-    }
-  }, sc.icon, " ", sc.label))), activeScenario && /*#__PURE__*/React.createElement("button", {
-    onClick: () => resetScenario(),
-    style: {
-      fontSize: 11,
-      marginTop: 8,
-      textDecoration: "underline",
-      color: "#8A938E",
-      background: "transparent",
-      border: "none",
-      padding: 0
-    }
-  }, "Szenario zurücksetzen")), /*#__PURE__*/React.createElement("div", {
-    style: {
-      borderRadius: 14,
-      padding: 16,
-      marginTop: 16,
-      backgroundColor: "#1D2321",
-      border: "1px solid #2E3634",
-      boxShadow: "0 2px 16px rgba(0,0,0,0.25)"
-    }
-  }, /*#__PURE__*/React.createElement("div", {
-    className: "stc-mono",
-    style: {
-      fontSize: 11,
-      textTransform: "uppercase",
-      color: "#8A938E",
-      marginBottom: 4
-    }
-  }, "🌤️ Wetterprognose (Open-Meteo)"), /*#__PURE__*/React.createElement("div", {
-    style: {
-      fontSize: 10,
-      color: "#5A6360",
-      marginBottom: 10
-    }
-  }, "Kostenlose 7-Tage-Strahlungsprognose — fliesst als Bias in die vorausschauende Batteriesteuerung ein. Benötigt Internetverbindung."), /*#__PURE__*/React.createElement("div", {
-    style: {
-      display: "flex",
-      gap: 6,
-      marginBottom: 8,
-      flexWrap: "wrap"
-    }
-  }, WEATHER_LOCATIONS.map(loc => /*#__PURE__*/React.createElement("button", {
-    key: loc.name,
-    onClick: () => setWeatherLoc({
-      lat: loc.lat,
-      lon: loc.lon
-    }),
-    style: {
-      fontSize: 10,
-      padding: "4px 8px",
-      borderRadius: 8,
-      border: `1px solid ${weatherLoc.lat === loc.lat ? "#4FA88C" : "#2E3634"}`,
-      color: weatherLoc.lat === loc.lat ? "#EDEDE9" : "#8A938E",
-      backgroundColor: "transparent"
-    }
-  }, loc.name))), /*#__PURE__*/React.createElement("div", {
-    style: {
-      display: "flex",
-      gap: 6,
-      marginBottom: 8
-    }
-  }, /*#__PURE__*/React.createElement("input", {
-    type: "number",
-    value: weatherLoc.lat,
-    onChange: e => setWeatherLoc(p => ({
-      ...p,
-      lat: parseFloat(e.target.value)
-    })),
-    style: {
-      flex: 1,
-      fontSize: 11,
-      padding: "6px 8px",
-      borderRadius: 8,
-      background: "#14181A",
-      border: "1px solid #2E3634",
-      color: "#EDEDE9"
-    },
-    placeholder: "Breitengrad"
-  }), /*#__PURE__*/React.createElement("input", {
-    type: "number",
-    value: weatherLoc.lon,
-    onChange: e => setWeatherLoc(p => ({
-      ...p,
-      lon: parseFloat(e.target.value)
-    })),
-    style: {
-      flex: 1,
-      fontSize: 11,
-      padding: "6px 8px",
-      borderRadius: 8,
-      background: "#14181A",
-      border: "1px solid #2E3634",
-      color: "#EDEDE9"
-    },
-    placeholder: "Längengrad"
-  })), /*#__PURE__*/React.createElement("button", {
-    onClick: loadWeatherForecast,
-    disabled: weatherLoading,
-    style: {
-      width: "100%",
-      fontSize: 12,
-      padding: "8px 0",
-      borderRadius: 8,
-      border: "1px dashed #3A423F",
-      color: "#8A938E",
-      background: "transparent"
-    }
-  }, weatherLoading ? "Lädt…" : "📡 Prognose laden"), weatherError && /*#__PURE__*/React.createElement("div", {
-    style: {
-      fontSize: 11,
-      color: "#D9705A",
-      marginTop: 6
-    }
-  }, weatherError), weatherForecast && /*#__PURE__*/React.createElement("div", {
-    style: {
-      marginTop: 10
-    }
-  }, /*#__PURE__*/React.createElement(ForecastMiniChart, {
-    data: weatherForecast.days
-  }), /*#__PURE__*/React.createElement("div", {
-    style: {
-      fontSize: 11,
-      color: "#8A938E",
-      marginTop: 6
-    }
-  }, "Ø nächste 7 Tage: ", /*#__PURE__*/React.createElement("span", {
-    style: {
-      color: "#F2B84B"
-    }
-  }, fmt0(weatherForecast.factor * 100), "%"), " vom saisonalen Mittel", weatherForecast.factor < 0.85 ? " — unterdurchschnittlich, Speicher hält mehr Reserve" : weatherForecast.factor > 1.15 ? " — überdurchschnittlich, Speicher verlässt sich mehr auf PV" : " — normal"), /*#__PURE__*/React.createElement("button", {
-    onClick: () => setWeatherForecast(null),
-    style: {
-      fontSize: 11,
-      marginTop: 6,
-      textDecoration: "underline",
-      color: "#8A938E",
-      background: "transparent",
-      border: "none",
-      padding: 0
-    }
-  }, "Prognose-Bias deaktivieren"))), /*#__PURE__*/React.createElement("div", {
-    style: {
-      borderRadius: 14,
-      padding: 16,
-      marginTop: 16,
-      backgroundColor: "#1A2420",
-      border: "1px solid #2E4A3E",
-      boxShadow: "0 2px 16px rgba(0,0,0,0.25)"
-    }
-  }, /*#__PURE__*/React.createElement("div", {
-    className: "stc-mono",
-    style: {
-      fontSize: 11,
-      textTransform: "uppercase",
-      color: "#4FA88C",
-      marginBottom: 2
-    }
-  }, "⚡ Live-Vorschau"), /*#__PURE__*/React.createElement("div", {
-    style: {
-      fontSize: 10,
-      color: "#5A6360",
-      marginBottom: 10
-    }
-  }, "Reagiert sofort auf jeden Trigger & Hebel — Tagesvorschau ", activeScenario ? `(Szenario: ${SCENARIOS.find(s => s.key === activeScenario)?.label})` : `Tag ${dayIdx}`, "."), /*#__PURE__*/React.createElement("div", {
-    style: {
-      display: "flex",
-      flexWrap: "wrap",
-      gap: 8,
-      marginBottom: 10
-    }
-  }, /*#__PURE__*/React.createElement("div", {
-    style: {
-      flex: "1 1 45%",
-      minWidth: 100
-    }
-  }, /*#__PURE__*/React.createElement("div", {
-    className: "stc-mono",
-    style: {
-      fontSize: 9,
-      color: "#8A938E"
-    }
-  }, "Netzbezug-Spitze"), /*#__PURE__*/React.createElement("div", {
-    className: "stc-display",
-    style: {
-      fontSize: 17,
-      fontWeight: 600,
-      color: "#E8A33D"
-    }
-  }, fmt1(Math.max(0, ...dayData.map(d => d.Netzbezug)) * 4), " kW")), /*#__PURE__*/React.createElement("div", {
-    style: {
-      flex: "1 1 45%",
-      minWidth: 100
-    }
-  }, /*#__PURE__*/React.createElement("div", {
-    className: "stc-mono",
-    style: {
-      fontSize: 9,
-      color: "#8A938E"
-    }
-  }, "PV-Ertrag heute"), /*#__PURE__*/React.createElement("div", {
-    className: "stc-display",
-    style: {
-      fontSize: 17,
-      fontWeight: 600,
-      color: "#4FA88C"
-    }
-  }, fmt1(dayData.reduce((a, d) => a - d.PV, 0)), " kWh")), levers.battery && /*#__PURE__*/React.createElement("div", {
-    style: {
-      flex: "1 1 45%",
-      minWidth: 100
-    }
-  }, /*#__PURE__*/React.createElement("div", {
-    className: "stc-mono",
-    style: {
-      fontSize: 9,
-      color: "#8A938E"
-    }
-  }, "Batterie-SoC (min–max)"), /*#__PURE__*/React.createElement("div", {
-    className: "stc-display",
-    style: {
-      fontSize: 17,
-      fontWeight: 600,
-      color: "#F2B84B"
-    }
-  }, fmt0(Math.min(...dayData.map(d => d.BatterieSoC))), "–", fmt0(Math.max(...dayData.map(d => d.BatterieSoC))), "%")), /*#__PURE__*/React.createElement("div", {
-    style: {
-      flex: "1 1 45%",
-      minWidth: 100
-    }
-  }, /*#__PURE__*/React.createElement("div", {
-    className: "stc-mono",
-    style: {
-      fontSize: 9,
-      color: "#8A938E"
-    }
-  }, "Aktive Trigger"), /*#__PURE__*/React.createElement("div", {
-    style: {
-      fontSize: 11,
-      color: "#EDEDE9",
-      marginTop: 3
-    }
-  }, levers.ewSignal === "gruen" ? "🟢" : levers.ewSignal === "gelb" ? "🟡" : "🔴", " ", activeScenario ? SCENARIOS.find(s => s.key === activeScenario)?.icon : "—", " ", weatherForecast ? "🌤️" : ""))), /*#__PURE__*/React.createElement("div", {
-    style: {
-      fontSize: 10,
-      color: "#8A938E",
-      marginBottom: 3
-    }
-  }, "Netzbezug-Verlauf (heute)"), /*#__PURE__*/React.createElement(MiniSparkline, {
-    data: dayData,
-    field: "Netzbezug",
-    color: "#E8A33D"
-  }), levers.battery && /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement("div", {
-    style: {
-      fontSize: 10,
-      color: "#8A938E",
-      margin: "8px 0 3px"
-    }
-  }, "Batterie-Ladezustand (heute)"), /*#__PURE__*/React.createElement(MiniSparkline, {
-    data: dayData,
-    field: "BatterieSoC",
-    color: "#F2B84B",
-    fixedMax: 100
-  }))), /*#__PURE__*/React.createElement("div", {
-    style: {
-      borderRadius: 14,
-      padding: 16,
-      marginBottom: 16,
-      backgroundColor: "#1D2321",
-      border: "1px solid #2E3634",
-      boxShadow: "0 2px 16px rgba(0,0,0,0.25)"
-    }
-  }, /*#__PURE__*/React.createElement("div", {
-    className: "stc-mono",
-    style: {
-      fontSize: 11,
-      textTransform: "uppercase",
-      color: "#8A938E",
       marginBottom: 12
     }
-  }, "Objekttyp"), /*#__PURE__*/React.createElement("div", {
+  }, "1 · Objekttyp"), /*#__PURE__*/React.createElement("div", {
     style: {
       display: "grid",
       gridTemplateColumns: "1fr 1fr 1fr",
@@ -2583,336 +2374,6 @@ function StromtarifCockpit() {
       marginTop: 6
     }
   }, "Referenzverbrauch: ≈ ", fmt0(bt.kwhPerUnit * scale), " kWh/Jahr")), /*#__PURE__*/React.createElement("div", {
-    className: "stc-mono",
-    style: {
-      fontSize: 11,
-      textTransform: "uppercase",
-      color: "#8A938E",
-      margin: "16px 0 8px"
-    }
-  }, "Hebel (per Button ein-/ausschaltbar)"), /*#__PURE__*/React.createElement(LeverButton, {
-    icon: "☀️",
-    title: "Photovoltaikanlage",
-    color: "#4FA88C",
-    active: levers.pv,
-    onToggle: v => setLevers(p => ({
-      ...p,
-      pv: v
-    }))
-  }, /*#__PURE__*/React.createElement(SliderRow, {
-    label: "Leistung pro Anlage",
-    value: levers.pvKwp,
-    onChange: v => setLevers(p => ({
-      ...p,
-      pvKwp: v
-    })),
-    min: 1,
-    max: 500,
-    step: 1,
-    unit: "kWp"
-  }), /*#__PURE__*/React.createElement(SliderRow, {
-    label: "Anzahl Anlagen",
-    value: levers.pvCount,
-    onChange: v => setLevers(p => ({
-      ...p,
-      pvCount: v
-    })),
-    min: 1,
-    max: 50,
-    step: 1,
-    unit: ""
-  }), /*#__PURE__*/React.createElement("div", {
-    style: {
-      fontSize: 11,
-      color: "#5A6360"
-    }
-  }, "Gesamtleistung: ", fmt1(levers.pvKwp * levers.pvCount), " kWp", levers.pvKwp * levers.pvCount >= 30 ? " (≥ 30 kWp — beachte abweichende Einspeise-/Messvorgaben in CH)" : "")), /*#__PURE__*/React.createElement(LeverButton, {
-    icon: "🔋",
-    title: "Batteriespeicher",
-    color: "#F2B84B",
-    active: levers.battery,
-    onToggle: v => setLevers(p => ({
-      ...p,
-      battery: v
-    }))
-  }, /*#__PURE__*/React.createElement(SliderRow, {
-    label: "Kapazität pro Speicher",
-    value: levers.batteryKwh,
-    onChange: v => setLevers(p => ({
-      ...p,
-      batteryKwh: v
-    })),
-    min: 1,
-    max: 200,
-    step: 1,
-    unit: "kWh"
-  }), /*#__PURE__*/React.createElement(SliderRow, {
-    label: "Lade-/Entladeleistung pro Speicher",
-    value: levers.batteryKw,
-    onChange: v => setLevers(p => ({
-      ...p,
-      batteryKw: v
-    })),
-    min: 1,
-    max: 100,
-    step: 1,
-    unit: "kW"
-  }), /*#__PURE__*/React.createElement(SliderRow, {
-    label: "Anzahl Speicher",
-    value: levers.batteryCount,
-    onChange: v => setLevers(p => ({
-      ...p,
-      batteryCount: v
-    })),
-    min: 1,
-    max: 20,
-    step: 1,
-    unit: ""
-  }), /*#__PURE__*/React.createElement(SliderRow, {
-    label: "Round-Trip-Wirkungsgrad",
-    value: levers.batteryEfficiency,
-    onChange: v => setLevers(p => ({
-      ...p,
-      batteryEfficiency: v
-    })),
-    min: 70,
-    max: 98,
-    step: 1,
-    unit: "%"
-  }), /*#__PURE__*/React.createElement(SliderRow, {
-    label: "Investitionskosten",
-    value: levers.batteryCostPerKwh,
-    onChange: v => setLevers(p => ({
-      ...p,
-      batteryCostPerKwh: v
-    })),
-    min: 200,
-    max: 1500,
-    step: 10,
-    unit: "CHF/kWh"
-  }), /*#__PURE__*/React.createElement("div", {
-    style: {
-      fontSize: 11,
-      color: "#5A6360"
-    }
-  }, "Gesamt: ", fmt1(levers.batteryKwh * levers.batteryCount), " kWh · ", fmt1(levers.batteryKw * levers.batteryCount), " kW · Investition ≈ ", fmt0(levers.batteryKwh * levers.batteryCount * levers.batteryCostPerKwh), " CHF"), /*#__PURE__*/React.createElement("div", {
-    style: {
-      marginTop: 10,
-      paddingTop: 10,
-      borderTop: "1px solid #2E3634"
-    }
-  }, /*#__PURE__*/React.createElement("div", {
-    style: {
-      fontSize: 11,
-      color: "#8A938E",
-      marginBottom: 4
-    }
-  }, "🧠 Steuerungsstrategie"), /*#__PURE__*/React.createElement("div", {
-    style: {
-      display: "flex",
-      gap: 6
-    }
-  }, /*#__PURE__*/React.createElement("button", {
-    onClick: () => setLevers(p => ({
-      ...p,
-      batteryStrategy: "reactive"
-    })),
-    style: {
-      flex: 1,
-      fontSize: 11,
-      padding: "6px 0",
-      borderRadius: 8,
-      border: `1px solid ${levers.batteryStrategy === "reactive" ? "#F2B84B" : "#2E3634"}`,
-      color: levers.batteryStrategy === "reactive" ? "#EDEDE9" : "#8A938E",
-      backgroundColor: levers.batteryStrategy === "reactive" ? "#2A2419" : "transparent"
-    }
-  }, "Reaktiv"), /*#__PURE__*/React.createElement("button", {
-    onClick: () => setLevers(p => ({
-      ...p,
-      batteryStrategy: "predictive"
-    })),
-    style: {
-      flex: 1,
-      fontSize: 11,
-      padding: "6px 0",
-      borderRadius: 8,
-      border: `1px solid ${levers.batteryStrategy === "predictive" ? "#F2B84B" : "#2E3634"}`,
-      color: levers.batteryStrategy === "predictive" ? "#EDEDE9" : "#8A938E",
-      backgroundColor: levers.batteryStrategy === "predictive" ? "#2A2419" : "transparent"
-    }
-  }, "Vorausschauend")), /*#__PURE__*/React.createElement("div", {
-    style: {
-      fontSize: 10,
-      color: "#5A6360",
-      marginTop: 4
-    }
-  }, levers.batteryStrategy === "predictive" ? "Lädt bei Bedarf gezielt aus dem günstigen NT-Tarif vor, wenn bald HT beginnt UND die eigene PV-Prognose den Tagesbedarf voraussichtlich nicht deckt. Berücksichtigt Tarifunterschied, Wetterprognose-Bias und EW-Signal." : "Lädt nur aus PV-Überschuss, entlädt bei Bedarf — maximiert Eigenverbrauch, ohne Tarif-Voraussicht."))), /*#__PURE__*/React.createElement(LeverButton, {
-    icon: "🔥",
-    title: "Wärmepumpe",
-    color: "#D9705A",
-    active: levers.wp,
-    onToggle: v => setLevers(p => ({
-      ...p,
-      wp: v
-    }))
-  }, /*#__PURE__*/React.createElement(SliderRow, {
-    label: "Thermische Leistung pro Anlage",
-    value: levers.wpKwTh,
-    onChange: v => setLevers(p => ({
-      ...p,
-      wpKwTh: v
-    })),
-    min: 2,
-    max: 40,
-    step: 1,
-    unit: "kW"
-  }), /*#__PURE__*/React.createElement(SliderRow, {
-    label: "Anzahl Anlagen",
-    value: levers.wpCount,
-    onChange: v => setLevers(p => ({
-      ...p,
-      wpCount: v
-    })),
-    min: 1,
-    max: 50,
-    step: 1,
-    unit: ""
-  }), /*#__PURE__*/React.createElement(SliderRow, {
-    label: "COP (Jahresarbeitszahl)",
-    value: levers.cop,
-    onChange: v => setLevers(p => ({
-      ...p,
-      cop: v
-    })),
-    min: 2,
-    max: 5,
-    step: 0.1,
-    unit: ""
-  }), /*#__PURE__*/React.createElement("div", {
-    style: {
-      fontSize: 11,
-      color: "#5A6360"
-    }
-  }, "Gesamtleistung: ", fmt1(levers.wpKwTh * levers.wpCount), " kW th")), /*#__PURE__*/React.createElement(LeverButton, {
-    icon: "🚿",
-    title: "Boiler (Warmwasser)",
-    color: "#C9A66B",
-    active: levers.boiler,
-    onToggle: v => setLevers(p => ({
-      ...p,
-      boiler: v
-    }))
-  }, /*#__PURE__*/React.createElement(SliderRow, {
-    label: "Leistung pro Boiler",
-    value: levers.boilerKw,
-    onChange: v => setLevers(p => ({
-      ...p,
-      boilerKw: v
-    })),
-    min: 1,
-    max: 20,
-    step: 0.5,
-    unit: "kW"
-  }), /*#__PURE__*/React.createElement(SliderRow, {
-    label: "Anzahl Boiler",
-    value: levers.boilerCount,
-    onChange: v => setLevers(p => ({
-      ...p,
-      boilerCount: v
-    })),
-    min: 1,
-    max: 50,
-    step: 1,
-    unit: ""
-  }), /*#__PURE__*/React.createElement("div", {
-    style: {
-      fontSize: 11,
-      color: "#5A6360"
-    }
-  }, "Gesamtleistung: ", fmt1(levers.boilerKw * levers.boilerCount), " kW")), /*#__PURE__*/React.createElement(LeverButton, {
-    icon: "🧯",
-    title: "Elektroheizung",
-    color: "#A6704A",
-    active: levers.elektro,
-    onToggle: v => setLevers(p => ({
-      ...p,
-      elektro: v
-    }))
-  }, /*#__PURE__*/React.createElement(SliderRow, {
-    label: "Leistung pro Anlage",
-    value: levers.elektroKw,
-    onChange: v => setLevers(p => ({
-      ...p,
-      elektroKw: v
-    })),
-    min: 1,
-    max: 100,
-    step: 1,
-    unit: "kW"
-  }), /*#__PURE__*/React.createElement(SliderRow, {
-    label: "Anzahl Anlagen",
-    value: levers.elektroCount,
-    onChange: v => setLevers(p => ({
-      ...p,
-      elektroCount: v
-    })),
-    min: 1,
-    max: 50,
-    step: 1,
-    unit: ""
-  }), /*#__PURE__*/React.createElement("div", {
-    style: {
-      fontSize: 11,
-      color: "#5A6360"
-    }
-  }, "Gesamtleistung: ", fmt1(levers.elektroKw * levers.elektroCount), " kW (direkt-elektrisch, COP = 1)")), /*#__PURE__*/React.createElement(LeverButton, {
-    icon: "⚡",
-    title: "Ladestation(en)",
-    color: "#8B6FD9",
-    active: levers.lad,
-    onToggle: v => setLevers(p => ({
-      ...p,
-      lad: v
-    }))
-  }, /*#__PURE__*/React.createElement(SliderRow, {
-    label: "Ladeleistung pro Station",
-    value: levers.ladKw,
-    onChange: v => setLevers(p => ({
-      ...p,
-      ladKw: v
-    })),
-    min: 3.7,
-    max: 150,
-    step: 0.1,
-    unit: "kW"
-  }), /*#__PURE__*/React.createElement(SliderRow, {
-    label: "Anzahl Stationen",
-    value: levers.ladCount,
-    onChange: v => setLevers(p => ({
-      ...p,
-      ladCount: v
-    })),
-    min: 1,
-    max: 100,
-    step: 1,
-    unit: ""
-  }), /*#__PURE__*/React.createElement(SliderRow, {
-    label: "Ladevorgänge / Station / Woche",
-    value: levers.ladSessionsPerWeek,
-    onChange: v => setLevers(p => ({
-      ...p,
-      ladSessionsPerWeek: v
-    })),
-    min: 1,
-    max: 14,
-    step: 1,
-    unit: ""
-  }), /*#__PURE__*/React.createElement("div", {
-    style: {
-      fontSize: 11,
-      color: "#5A6360"
-    }
-  }, "Gesamtleistung: ", fmt1(levers.ladKw * levers.ladCount), " kW")), /*#__PURE__*/React.createElement("div", {
     style: {
       borderRadius: 14,
       padding: 16,
@@ -2929,7 +2390,7 @@ function StromtarifCockpit() {
       color: "#8A938E",
       marginBottom: 4
     }
-  }, "Datenquelle Grundlast"), /*#__PURE__*/React.createElement("div", {
+  }, "2 · Datenquelle Grundlast"), /*#__PURE__*/React.createElement("div", {
     style: {
       fontSize: 10,
       color: "#5A6360",
@@ -3106,37 +2567,423 @@ function StromtarifCockpit() {
       fontSize: 11,
       textTransform: "uppercase",
       color: "#8A938E",
+      marginBottom: 4
+    }
+  }, "3 · 🌤️ Wetterprognose (Open-Meteo)"), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 10,
+      color: "#5A6360",
+      marginBottom: 10
+    }
+  }, "Kostenlose 7-Tage-Strahlungs-, Temperatur- und Bewölkungsprognose — fliesst als Bias in die vorausschauende Batteriesteuerung ein. Benötigt Internetverbindung."), /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      gap: 6,
+      marginBottom: 8,
+      flexWrap: "wrap"
+    }
+  }, WEATHER_LOCATIONS.map(loc => /*#__PURE__*/React.createElement("button", {
+    key: loc.name,
+    onClick: () => setWeatherLoc({
+      lat: loc.lat,
+      lon: loc.lon
+    }),
+    style: {
+      fontSize: 10,
+      padding: "4px 8px",
+      borderRadius: 8,
+      border: `1px solid ${weatherLoc.lat === loc.lat ? "#4FA88C" : "#2E3634"}`,
+      color: weatherLoc.lat === loc.lat ? "#EDEDE9" : "#8A938E",
+      backgroundColor: "transparent"
+    }
+  }, loc.name))), /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      gap: 6,
+      marginBottom: 8
+    }
+  }, /*#__PURE__*/React.createElement("input", {
+    type: "number",
+    value: weatherLoc.lat,
+    onChange: e => setWeatherLoc(p => ({
+      ...p,
+      lat: parseFloat(e.target.value)
+    })),
+    style: {
+      flex: 1,
+      fontSize: 11,
+      padding: "6px 8px",
+      borderRadius: 8,
+      background: "#14181A",
+      border: "1px solid #2E3634",
+      color: "#EDEDE9"
+    },
+    placeholder: "Breitengrad"
+  }), /*#__PURE__*/React.createElement("input", {
+    type: "number",
+    value: weatherLoc.lon,
+    onChange: e => setWeatherLoc(p => ({
+      ...p,
+      lon: parseFloat(e.target.value)
+    })),
+    style: {
+      flex: 1,
+      fontSize: 11,
+      padding: "6px 8px",
+      borderRadius: 8,
+      background: "#14181A",
+      border: "1px solid #2E3634",
+      color: "#EDEDE9"
+    },
+    placeholder: "Längengrad"
+  })), /*#__PURE__*/React.createElement("button", {
+    onClick: loadWeatherForecast,
+    disabled: weatherLoading,
+    style: {
+      width: "100%",
+      fontSize: 12,
+      padding: "8px 0",
+      borderRadius: 8,
+      border: "1px dashed #3A423F",
+      color: "#8A938E",
+      background: "transparent"
+    }
+  }, weatherLoading ? "Lädt…" : "📡 Prognose laden"), weatherError && /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 11,
+      color: "#D9705A",
+      marginTop: 6
+    }
+  }, weatherError), weatherForecast && /*#__PURE__*/React.createElement("div", {
+    style: {
+      marginTop: 12
+    }
+  }, /*#__PURE__*/React.createElement(WeatherDayCards, {
+    data: weatherForecast.days
+  }), /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      flexWrap: "wrap",
+      gap: 8,
+      marginTop: 10
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      flex: "1 1 45%"
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "stc-mono",
+    style: {
+      fontSize: 9,
+      color: "#8A938E"
+    }
+  }, "Ø Prognose 7 Tage"), /*#__PURE__*/React.createElement("div", {
+    className: "stc-display",
+    style: {
+      fontSize: 15,
+      fontWeight: 600,
+      color: "#F2B84B"
+    }
+  }, weatherForecast.avgForecast, " kWh/kWp")), /*#__PURE__*/React.createElement("div", {
+    style: {
+      flex: "1 1 45%"
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "stc-mono",
+    style: {
+      fontSize: 9,
+      color: "#8A938E"
+    }
+  }, "Saisonales Modellmittel"), /*#__PURE__*/React.createElement("div", {
+    className: "stc-display",
+    style: {
+      fontSize: 15,
+      fontWeight: 600,
+      color: "#8A938E"
+    }
+  }, weatherForecast.avgModel, " kWh/kWp"))), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 11,
+      color: "#8A938E",
+      marginTop: 8
+    }
+  }, "Prognose-Faktor: ", /*#__PURE__*/React.createElement("span", {
+    style: {
+      color: "#F2B84B",
+      fontWeight: 600
+    }
+  }, fmt0(weatherForecast.factor * 100), "%"), " vom saisonalen Mittel", weatherForecast.factor < 0.85 ? " — unterdurchschnittlich, Speicher hält mehr Reserve" : weatherForecast.factor > 1.15 ? " — überdurchschnittlich, Speicher verlässt sich mehr auf PV" : " — normal"), /*#__PURE__*/React.createElement("button", {
+    onClick: () => setWeatherForecast(null),
+    style: {
+      fontSize: 11,
+      marginTop: 6,
+      textDecoration: "underline",
+      color: "#8A938E",
+      background: "transparent",
+      border: "none",
+      padding: 0
+    }
+  }, "Prognose-Bias deaktivieren"))), /*#__PURE__*/React.createElement("div", {
+    style: {
+      borderRadius: 14,
+      padding: 16,
+      marginTop: 16,
+      backgroundColor: "#1D2321",
+      border: "1px solid #2E3634",
+      boxShadow: "0 2px 16px rgba(0,0,0,0.25)"
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "stc-mono",
+    style: {
+      fontSize: 11,
+      textTransform: "uppercase",
+      color: "#8A938E",
+      marginBottom: 4
+    }
+  }, "4 · 💶 Preissignal EW"), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 10,
+      color: "#5A6360",
+      marginBottom: 10
+    }
+  }, "Vom Elektrizitätswerk übermittelter Tarifplan — ", tariffTiers.length, " Tarifstufen mit eigenen Zeitfenstern. Preise und Zeiten frei editierbar."), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 10,
+      color: "#8A938E",
+      marginBottom: 4
+    }
+  }, "Tagesverlauf Werktag"), /*#__PURE__*/React.createElement(TariffScheduleStrip, {
+    tiers: tariffTiers,
+    weekend: false
+  }), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 10,
+      color: "#8A938E",
+      margin: "10px 0 4px"
+    }
+  }, "Tagesverlauf Wochenende"), /*#__PURE__*/React.createElement(TariffScheduleStrip, {
+    tiers: tariffTiers,
+    weekend: true
+  }), /*#__PURE__*/React.createElement("div", {
+    style: {
+      marginTop: 14,
+      display: "flex",
+      flexDirection: "column",
+      gap: 8
+    }
+  }, tariffTiers.map((tier, idx) => /*#__PURE__*/React.createElement("div", {
+    key: tier.id,
+    style: {
+      borderRadius: 10,
+      padding: 10,
+      border: `1px solid ${tier.color}66`,
+      backgroundColor: "#181D1F"
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      alignItems: "center",
+      justifyContent: "space-between",
+      marginBottom: 6
+    }
+  }, /*#__PURE__*/React.createElement("span", {
+    style: {
+      fontSize: 12,
+      fontWeight: 600,
+      color: tier.color
+    }
+  }, "● ", tier.name), /*#__PURE__*/React.createElement("span", {
+    className: "stc-mono",
+    style: {
+      fontSize: 13,
+      color: "#EDEDE9"
+    }
+  }, tier.price, " Rp/kWh")), /*#__PURE__*/React.createElement(SliderRow, {
+    label: "Preis",
+    value: tier.price,
+    onChange: v => updateTier(idx, {
+      price: v
+    }),
+    min: 0,
+    max: 60,
+    step: 0.5,
+    unit: "Rp/kWh"
+  }), /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      gap: 6,
+      marginTop: 8
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      flex: 1
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 9,
+      color: "#8A938E",
+      marginBottom: 2
+    }
+  }, "Von"), /*#__PURE__*/React.createElement("input", {
+    type: "number",
+    min: 0,
+    max: 23,
+    value: tier.startHour,
+    onChange: e => updateTier(idx, {
+      startHour: parseInt(e.target.value) || 0
+    }),
+    style: {
+      width: "100%",
+      fontSize: 11,
+      padding: "5px 6px",
+      borderRadius: 6,
+      background: "#14181A",
+      border: "1px solid #2E3634",
+      color: "#EDEDE9"
+    }
+  })), /*#__PURE__*/React.createElement("div", {
+    style: {
+      flex: 1
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 9,
+      color: "#8A938E",
+      marginBottom: 2
+    }
+  }, "Bis"), /*#__PURE__*/React.createElement("input", {
+    type: "number",
+    min: 0,
+    max: 24,
+    value: tier.endHour,
+    onChange: e => updateTier(idx, {
+      endHour: parseInt(e.target.value) || 0
+    }),
+    style: {
+      width: "100%",
+      fontSize: 11,
+      padding: "5px 6px",
+      borderRadius: 6,
+      background: "#14181A",
+      border: "1px solid #2E3634",
+      color: "#EDEDE9"
+    }
+  })), /*#__PURE__*/React.createElement("div", {
+    style: {
+      flex: 1.5
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 9,
+      color: "#8A938E",
+      marginBottom: 2
+    }
+  }, "Gültig"), /*#__PURE__*/React.createElement("select", {
+    value: tier.scope,
+    onChange: e => updateTier(idx, {
+      scope: e.target.value
+    }),
+    style: {
+      width: "100%",
+      fontSize: 11,
+      padding: "5px 6px",
+      borderRadius: 6,
+      background: "#14181A",
+      border: "1px solid #2E3634",
+      color: "#EDEDE9"
+    }
+  }, /*#__PURE__*/React.createElement("option", {
+    value: "all"
+  }, "Alle Tage"), /*#__PURE__*/React.createElement("option", {
+    value: "weekday"
+  }, "Werktags"), /*#__PURE__*/React.createElement("option", {
+    value: "weekend"
+  }, "Wochenende"))))))), /*#__PURE__*/React.createElement("div", {
+    style: {
+      marginTop: 14,
+      paddingTop: 12,
+      borderTop: "1px solid #2E3634"
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 10,
+      color: "#8A938E",
+      marginBottom: 4
+    }
+  }, "Zusätzliches Netzstatus-Signal (Demand Response)"), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 9,
+      color: "#5A6360",
+      marginBottom: 8
+    }
+  }, "Simulierter Trigger — hier würde in der Praxis ein reales Signal des EW andocken (z.B. via API/EEBus) und die Batterie-Netzladung sperren/drosseln."), /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      gap: 6
+    }
+  }, [{
+    key: "gruen",
+    label: "🟢 Grün",
+    desc: "Normal"
+  }, {
+    key: "gelb",
+    label: "🟡 Gelb",
+    desc: "Angespannt"
+  }, {
+    key: "rot",
+    label: "🔴 Rot",
+    desc: "Kritisch"
+  }].map(opt => /*#__PURE__*/React.createElement("button", {
+    key: opt.key,
+    onClick: () => setLevers(p => ({
+      ...p,
+      ewSignal: opt.key
+    })),
+    style: {
+      flex: 1,
+      fontSize: 11,
+      padding: "8px 2px",
+      borderRadius: 8,
+      textAlign: "center",
+      border: `1px solid ${levers.ewSignal === opt.key ? "#4FA88C" : "#2E3634"}`,
+      color: levers.ewSignal === opt.key ? "#EDEDE9" : "#8A938E",
+      backgroundColor: levers.ewSignal === opt.key ? "#1A2420" : "transparent"
+    }
+  }, /*#__PURE__*/React.createElement("div", null, opt.label), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 9,
+      color: "#5A6360"
+    }
+  }, opt.desc)))), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 10,
+      color: "#5A6360",
+      marginTop: 8
+    }
+  }, levers.ewSignal === "rot" && "Rot: Netzladung der Batterie komplett gesperrt (Netzentlastung hat Vorrang).", levers.ewSignal === "gelb" && "Gelb: Netzladung auf 50% Leistung gedrosselt.", levers.ewSignal === "gruen" && "Grün: volle Vorausschau-/Arbitragefunktion erlaubt."))), /*#__PURE__*/React.createElement("div", {
+    style: {
+      borderRadius: 14,
+      padding: 16,
+      marginTop: 16,
+      backgroundColor: "#1D2321",
+      border: "1px solid #2E3634",
+      boxShadow: "0 2px 16px rgba(0,0,0,0.25)"
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "stc-mono",
+    style: {
+      fontSize: 11,
+      textTransform: "uppercase",
+      color: "#8A938E",
       marginBottom: 12
     }
-  }, "Tarifparameter"), /*#__PURE__*/React.createElement("div", {
+  }, "5 · Tarifparameter"), /*#__PURE__*/React.createElement("div", {
     style: {
       display: "flex",
       flexDirection: "column",
       gap: 10
     }
   }, /*#__PURE__*/React.createElement(SliderRow, {
-    label: "Hochtarif (HT)",
-    value: tariff.htPrice,
-    onChange: v => setTariff(p => ({
-      ...p,
-      htPrice: v
-    })),
-    min: 5,
-    max: 45,
-    step: 0.5,
-    unit: "Rp/kWh"
-  }), /*#__PURE__*/React.createElement(SliderRow, {
-    label: "Niedertarif (NT)",
-    value: tariff.ntPrice,
-    onChange: v => setTariff(p => ({
-      ...p,
-      ntPrice: v
-    })),
-    min: 5,
-    max: 35,
-    step: 0.5,
-    unit: "Rp/kWh"
-  }), /*#__PURE__*/React.createElement(SliderRow, {
     label: "Netzentgelt",
     value: tariff.netzentgelt,
     onChange: v => setTariff(p => ({
@@ -3192,6 +3039,511 @@ function StromtarifCockpit() {
     max: 200,
     step: 5,
     unit: "CHF/kW·a"
+  }))), /*#__PURE__*/React.createElement("div", {
+    style: {
+      borderRadius: 14,
+      padding: 16,
+      marginTop: 16,
+      backgroundColor: "#1D2321",
+      border: "1px solid #2E3634",
+      boxShadow: "0 2px 16px rgba(0,0,0,0.25)"
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "stc-mono",
+    style: {
+      fontSize: 11,
+      textTransform: "uppercase",
+      color: "#8A938E",
+      marginBottom: 4
+    }
+  }, "6 · 🎬 Szenarien (Trigger)"), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 10,
+      color: "#5A6360",
+      marginBottom: 10
+    }
+  }, "Ein Klick stellt Tagesprofil-Vorschau und Bedingungen auf ein Testszenario — praktisch für Kundengespräche und Demonstrationen."), /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "grid",
+      gridTemplateColumns: "1fr 1fr",
+      gap: 6
+    }
+  }, SCENARIOS.map(sc => /*#__PURE__*/React.createElement("button", {
+    key: sc.key,
+    onClick: () => applyScenario(sc),
+    style: {
+      fontSize: 11,
+      padding: "8px 6px",
+      borderRadius: 8,
+      textAlign: "left",
+      border: `1px solid ${activeScenario === sc.key ? "#E8A33D" : "#2E3634"}`,
+      color: activeScenario === sc.key ? "#EDEDE9" : "#8A938E",
+      backgroundColor: activeScenario === sc.key ? "#241D14" : "transparent"
+    }
+  }, sc.icon, " ", sc.label))), activeScenario && /*#__PURE__*/React.createElement("button", {
+    onClick: () => resetScenario(),
+    style: {
+      fontSize: 11,
+      marginTop: 8,
+      textDecoration: "underline",
+      color: "#8A938E",
+      background: "transparent",
+      border: "none",
+      padding: 0
+    }
+  }, "Szenario zurücksetzen")), /*#__PURE__*/React.createElement("div", {
+    className: "stc-mono",
+    style: {
+      fontSize: 11,
+      textTransform: "uppercase",
+      color: "#8A938E",
+      margin: "16px 0 8px"
+    }
+  }, "7 · Hebel (per Button ein-/ausschaltbar)"), /*#__PURE__*/React.createElement(LeverButton, {
+    icon: "☀️",
+    title: "Photovoltaikanlage",
+    color: "#4FA88C",
+    active: levers.pv,
+    onToggle: v => setLevers(p => ({
+      ...p,
+      pv: v
+    }))
+  }, /*#__PURE__*/React.createElement(SliderRow, {
+    label: "Leistung pro Anlage",
+    value: levers.pvKwp,
+    onChange: v => setLevers(p => ({
+      ...p,
+      pvKwp: v
+    })),
+    min: 1,
+    max: 500,
+    step: 1,
+    unit: "kWp"
+  }), /*#__PURE__*/React.createElement(SliderRow, {
+    label: "Anzahl Anlagen",
+    value: levers.pvCount,
+    onChange: v => setLevers(p => ({
+      ...p,
+      pvCount: v
+    })),
+    min: 1,
+    max: 50,
+    step: 1,
+    unit: ""
+  }), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 11,
+      color: "#5A6360"
+    }
+  }, "Gesamtleistung: ", fmt1(levers.pvKwp * levers.pvCount), " kWp", levers.pvKwp * levers.pvCount >= 30 ? " (≥ 30 kWp — beachte abweichende Einspeise-/Messvorgaben in CH)" : "")), /*#__PURE__*/React.createElement(LeverButton, {
+    icon: "🔋",
+    title: "Batteriespeicher",
+    color: "#F2B84B",
+    active: levers.battery,
+    onToggle: v => setLevers(p => ({
+      ...p,
+      battery: v
+    }))
+  }, /*#__PURE__*/React.createElement(SliderRow, {
+    label: "Kapazität pro Speicher",
+    value: levers.batteryKwh,
+    onChange: v => setLevers(p => ({
+      ...p,
+      batteryKwh: v
+    })),
+    min: 1,
+    max: 200,
+    step: 1,
+    unit: "kWh"
+  }), /*#__PURE__*/React.createElement(SliderRow, {
+    label: "Lade-/Entladeleistung pro Speicher",
+    value: levers.batteryKw,
+    onChange: v => setLevers(p => ({
+      ...p,
+      batteryKw: v
+    })),
+    min: 1,
+    max: 100,
+    step: 1,
+    unit: "kW"
+  }), /*#__PURE__*/React.createElement(SliderRow, {
+    label: "Anzahl Speicher",
+    value: levers.batteryCount,
+    onChange: v => setLevers(p => ({
+      ...p,
+      batteryCount: v
+    })),
+    min: 1,
+    max: 20,
+    step: 1,
+    unit: ""
+  }), /*#__PURE__*/React.createElement(SliderRow, {
+    label: "Round-Trip-Wirkungsgrad",
+    value: levers.batteryEfficiency,
+    onChange: v => setLevers(p => ({
+      ...p,
+      batteryEfficiency: v
+    })),
+    min: 70,
+    max: 98,
+    step: 1,
+    unit: "%"
+  }), /*#__PURE__*/React.createElement(SliderRow, {
+    label: "Investitionskosten",
+    value: levers.batteryCostPerKwh,
+    onChange: v => setLevers(p => ({
+      ...p,
+      batteryCostPerKwh: v
+    })),
+    min: 200,
+    max: 1500,
+    step: 10,
+    unit: "CHF/kWh"
+  }), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 11,
+      color: "#5A6360"
+    }
+  }, "Gesamt: ", fmt1(levers.batteryKwh * levers.batteryCount), " kWh · ", fmt1(levers.batteryKw * levers.batteryCount), " kW · Investition ≈ ", fmt0(levers.batteryKwh * levers.batteryCount * levers.batteryCostPerKwh), " CHF"), /*#__PURE__*/React.createElement("div", {
+    style: {
+      marginTop: 10,
+      paddingTop: 10,
+      borderTop: "1px solid #2E3634"
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 11,
+      color: "#8A938E",
+      marginBottom: 4
+    }
+  }, "🧠 Steuerungsstrategie"), /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      gap: 6
+    }
+  }, /*#__PURE__*/React.createElement("button", {
+    onClick: () => setLevers(p => ({
+      ...p,
+      batteryStrategy: "reactive"
+    })),
+    style: {
+      flex: 1,
+      fontSize: 11,
+      padding: "6px 0",
+      borderRadius: 8,
+      border: `1px solid ${levers.batteryStrategy === "reactive" ? "#F2B84B" : "#2E3634"}`,
+      color: levers.batteryStrategy === "reactive" ? "#EDEDE9" : "#8A938E",
+      backgroundColor: levers.batteryStrategy === "reactive" ? "#2A2419" : "transparent"
+    }
+  }, "Reaktiv"), /*#__PURE__*/React.createElement("button", {
+    onClick: () => setLevers(p => ({
+      ...p,
+      batteryStrategy: "predictive"
+    })),
+    style: {
+      flex: 1,
+      fontSize: 11,
+      padding: "6px 0",
+      borderRadius: 8,
+      border: `1px solid ${levers.batteryStrategy === "predictive" ? "#F2B84B" : "#2E3634"}`,
+      color: levers.batteryStrategy === "predictive" ? "#EDEDE9" : "#8A938E",
+      backgroundColor: levers.batteryStrategy === "predictive" ? "#2A2419" : "transparent"
+    }
+  }, "Vorausschauend")), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 10,
+      color: "#5A6360",
+      marginTop: 4
+    }
+  }, levers.batteryStrategy === "predictive" ? "Lädt bei Bedarf gezielt aus einer günstigeren Tarifstufe vor, wenn bald eine teurere beginnt UND die eigene PV-Prognose den Tagesbedarf voraussichtlich nicht deckt. Berücksichtigt alle Tarifstufen, Wetterprognose-Bias und Netzstatus-Signal." : "Lädt nur aus PV-Überschuss, entlädt bei Bedarf — maximiert Eigenverbrauch, ohne Tarif-Voraussicht."))), /*#__PURE__*/React.createElement(LeverButton, {
+    icon: "🔥",
+    title: "Wärmepumpe",
+    color: "#D9705A",
+    active: levers.wp,
+    onToggle: v => setLevers(p => ({
+      ...p,
+      wp: v
+    }))
+  }, /*#__PURE__*/React.createElement(SliderRow, {
+    label: "Thermische Leistung pro Anlage",
+    value: levers.wpKwTh,
+    onChange: v => setLevers(p => ({
+      ...p,
+      wpKwTh: v
+    })),
+    min: 2,
+    max: 40,
+    step: 1,
+    unit: "kW"
+  }), /*#__PURE__*/React.createElement(SliderRow, {
+    label: "Anzahl Anlagen",
+    value: levers.wpCount,
+    onChange: v => setLevers(p => ({
+      ...p,
+      wpCount: v
+    })),
+    min: 1,
+    max: 50,
+    step: 1,
+    unit: ""
+  }), /*#__PURE__*/React.createElement(SliderRow, {
+    label: "COP (Jahresarbeitszahl)",
+    value: levers.cop,
+    onChange: v => setLevers(p => ({
+      ...p,
+      cop: v
+    })),
+    min: 2,
+    max: 5,
+    step: 0.1,
+    unit: ""
+  }), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 11,
+      color: "#5A6360"
+    }
+  }, "Gesamtleistung: ", fmt1(levers.wpKwTh * levers.wpCount), " kW th")), /*#__PURE__*/React.createElement(LeverButton, {
+    icon: "🚿",
+    title: "Boiler (Warmwasser)",
+    color: "#C9A66B",
+    active: levers.boiler,
+    onToggle: v => setLevers(p => ({
+      ...p,
+      boiler: v
+    }))
+  }, /*#__PURE__*/React.createElement(SliderRow, {
+    label: "Leistung pro Boiler",
+    value: levers.boilerKw,
+    onChange: v => setLevers(p => ({
+      ...p,
+      boilerKw: v
+    })),
+    min: 1,
+    max: 20,
+    step: 0.5,
+    unit: "kW"
+  }), /*#__PURE__*/React.createElement(SliderRow, {
+    label: "Anzahl Boiler",
+    value: levers.boilerCount,
+    onChange: v => setLevers(p => ({
+      ...p,
+      boilerCount: v
+    })),
+    min: 1,
+    max: 50,
+    step: 1,
+    unit: ""
+  }), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 11,
+      color: "#5A6360"
+    }
+  }, "Gesamtleistung: ", fmt1(levers.boilerKw * levers.boilerCount), " kW")), /*#__PURE__*/React.createElement(LeverButton, {
+    icon: "🧯",
+    title: "Elektroheizung",
+    color: "#A6704A",
+    active: levers.elektro,
+    onToggle: v => setLevers(p => ({
+      ...p,
+      elektro: v
+    }))
+  }, /*#__PURE__*/React.createElement(SliderRow, {
+    label: "Leistung pro Anlage",
+    value: levers.elektroKw,
+    onChange: v => setLevers(p => ({
+      ...p,
+      elektroKw: v
+    })),
+    min: 1,
+    max: 100,
+    step: 1,
+    unit: "kW"
+  }), /*#__PURE__*/React.createElement(SliderRow, {
+    label: "Anzahl Anlagen",
+    value: levers.elektroCount,
+    onChange: v => setLevers(p => ({
+      ...p,
+      elektroCount: v
+    })),
+    min: 1,
+    max: 50,
+    step: 1,
+    unit: ""
+  }), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 11,
+      color: "#5A6360"
+    }
+  }, "Gesamtleistung: ", fmt1(levers.elektroKw * levers.elektroCount), " kW (direkt-elektrisch, COP = 1)")), /*#__PURE__*/React.createElement(LeverButton, {
+    icon: "⚡",
+    title: "Ladestation(en)",
+    color: "#8B6FD9",
+    active: levers.lad,
+    onToggle: v => setLevers(p => ({
+      ...p,
+      lad: v
+    }))
+  }, /*#__PURE__*/React.createElement(SliderRow, {
+    label: "Ladeleistung pro Station",
+    value: levers.ladKw,
+    onChange: v => setLevers(p => ({
+      ...p,
+      ladKw: v
+    })),
+    min: 3.7,
+    max: 150,
+    step: 0.1,
+    unit: "kW"
+  }), /*#__PURE__*/React.createElement(SliderRow, {
+    label: "Anzahl Stationen",
+    value: levers.ladCount,
+    onChange: v => setLevers(p => ({
+      ...p,
+      ladCount: v
+    })),
+    min: 1,
+    max: 100,
+    step: 1,
+    unit: ""
+  }), /*#__PURE__*/React.createElement(SliderRow, {
+    label: "Ladevorgänge / Station / Woche",
+    value: levers.ladSessionsPerWeek,
+    onChange: v => setLevers(p => ({
+      ...p,
+      ladSessionsPerWeek: v
+    })),
+    min: 1,
+    max: 14,
+    step: 1,
+    unit: ""
+  }), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 11,
+      color: "#5A6360"
+    }
+  }, "Gesamtleistung: ", fmt1(levers.ladKw * levers.ladCount), " kW")), /*#__PURE__*/React.createElement("div", {
+    style: {
+      borderRadius: 14,
+      padding: 16,
+      marginTop: 16,
+      marginBottom: 16,
+      backgroundColor: "#1A2420",
+      border: "1px solid #2E4A3E",
+      boxShadow: "0 2px 16px rgba(0,0,0,0.25)"
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "stc-mono",
+    style: {
+      fontSize: 11,
+      textTransform: "uppercase",
+      color: "#4FA88C",
+      marginBottom: 2
+    }
+  }, "⚡ Live-Vorschau"), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 10,
+      color: "#5A6360",
+      marginBottom: 10
+    }
+  }, "Reagiert sofort auf jeden Trigger & Hebel — Tagesvorschau ", activeScenario ? `(Szenario: ${SCENARIOS.find(s => s.key === activeScenario)?.label})` : `Tag ${dayIdx}`, "."), /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      flexWrap: "wrap",
+      gap: 8,
+      marginBottom: 10
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      flex: "1 1 45%",
+      minWidth: 100
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "stc-mono",
+    style: {
+      fontSize: 9,
+      color: "#8A938E"
+    }
+  }, "Netzbezug-Spitze"), /*#__PURE__*/React.createElement("div", {
+    className: "stc-display",
+    style: {
+      fontSize: 17,
+      fontWeight: 600,
+      color: "#E8A33D"
+    }
+  }, fmt1(Math.max(0, ...dayData.map(d => d.Netzbezug)) * 4), " kW")), /*#__PURE__*/React.createElement("div", {
+    style: {
+      flex: "1 1 45%",
+      minWidth: 100
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "stc-mono",
+    style: {
+      fontSize: 9,
+      color: "#8A938E"
+    }
+  }, "PV-Ertrag heute"), /*#__PURE__*/React.createElement("div", {
+    className: "stc-display",
+    style: {
+      fontSize: 17,
+      fontWeight: 600,
+      color: "#4FA88C"
+    }
+  }, fmt1(dayData.reduce((a, d) => a - d.PV, 0)), " kWh")), levers.battery && /*#__PURE__*/React.createElement("div", {
+    style: {
+      flex: "1 1 45%",
+      minWidth: 100
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "stc-mono",
+    style: {
+      fontSize: 9,
+      color: "#8A938E"
+    }
+  }, "Batterie-SoC (min–max)"), /*#__PURE__*/React.createElement("div", {
+    className: "stc-display",
+    style: {
+      fontSize: 17,
+      fontWeight: 600,
+      color: "#F2B84B"
+    }
+  }, fmt0(Math.min(...dayData.map(d => d.BatterieSoC))), "–", fmt0(Math.max(...dayData.map(d => d.BatterieSoC))), "%")), /*#__PURE__*/React.createElement("div", {
+    style: {
+      flex: "1 1 45%",
+      minWidth: 100
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "stc-mono",
+    style: {
+      fontSize: 9,
+      color: "#8A938E"
+    }
+  }, "Aktive Trigger"), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 11,
+      color: "#EDEDE9",
+      marginTop: 3
+    }
+  }, levers.ewSignal === "gruen" ? "🟢" : levers.ewSignal === "gelb" ? "🟡" : "🔴", " ", activeScenario ? SCENARIOS.find(s => s.key === activeScenario)?.icon : "—", " ", weatherForecast ? "🌤️" : ""))), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 10,
+      color: "#8A938E",
+      marginBottom: 3
+    }
+  }, "Netzbezug-Verlauf (heute)"), /*#__PURE__*/React.createElement(MiniSparkline, {
+    data: dayData,
+    field: "Netzbezug",
+    color: "#E8A33D"
+  }), levers.battery && /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 10,
+      color: "#8A938E",
+      margin: "8px 0 3px"
+    }
+  }, "Batterie-Ladezustand (heute)"), /*#__PURE__*/React.createElement(MiniSparkline, {
+    data: dayData,
+    field: "BatterieSoC",
+    color: "#F2B84B",
+    fixedMax: 100
   })))), /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("div", {
     style: {
       display: "flex",
